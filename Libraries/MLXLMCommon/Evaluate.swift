@@ -84,6 +84,10 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for repetition penalty
     public var repetitionContextSize: Int
 
+    // wangqi [2026-01-07] - Tool call tag configuration
+    public var toolcallStartTag: String
+    public var toolcallEndTag: String
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -94,7 +98,9 @@ public struct GenerateParameters: Sendable {
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        toolcallStartTag: String = "<tool_call>",  // wangqi [2026-01-07]
+        toolcallEndTag: String = "</tool_call>"    // wangqi [2026-01-07]
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -106,6 +112,8 @@ public struct GenerateParameters: Sendable {
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.prefillStepSize = prefillStepSize
+        self.toolcallStartTag = toolcallStartTag  // wangqi [2026-01-07]
+        self.toolcallEndTag = toolcallEndTag      // wangqi [2026-01-07]
     }
 
     public func sampler() -> LogitSampler {
@@ -797,7 +805,9 @@ public func generate(
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
     return generate(
-        input: input, context: context, iterator: iterator)
+        input: input, context: context, iterator: iterator,
+        toolcallStartTag: parameters.toolcallStartTag,    // wangqi [2026-01-07]
+        toolcallEndTag: parameters.toolcallEndTag)        // wangqi [2026-01-07]
 }
 
 /// Low-level token generation using a ``TokenIterator``, returning an `AsyncStream<Generation>`.
@@ -806,10 +816,14 @@ public func generate(
 ///   - input: prepared language model input
 ///   - context: model context (model and tokenizer)
 ///   - iterator: token iterator
+///   - toolcallStartTag: start tag for tool calls (default: "<tool_call>")
+///   - toolcallEndTag: end tag for tool calls (default: "</tool_call>")
 /// - Returns: An `AsyncStream` that emits `Generation` values
 public func generate(
     input: LMInput, context: ModelContext,
-    iterator: TokenIterator
+    iterator: TokenIterator,
+    toolcallStartTag: String = "<tool_call>",   // wangqi [2026-01-07]
+    toolcallEndTag: String = "</tool_call>"     // wangqi [2026-01-07]
 ) -> AsyncStream<Generation> {
 
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
@@ -827,7 +841,8 @@ public func generate(
 
         var tokenCount = 0
         var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
-        let toolCallProcessor = ToolCallProcessor()
+        // wangqi [2026-01-07] - Use configurable tags
+        let toolCallProcessor = ToolCallProcessor(startTag: toolcallStartTag, endTag: toolcallEndTag)
 
         for token in iterator {
 
@@ -865,6 +880,9 @@ public func generate(
 
         let now = Date.timeIntervalSinceReferenceDate
         let generateTime = now - start
+
+        // wangqi [2026-01-07] - Debug log for generation completion
+        print("[MLXGenerate] Generation complete. Tokens: \(tokenCount), Remaining tool calls: \(toolCallProcessor.toolCalls.count)")
 
         let info = GenerateCompletionInfo(
             promptTokenCount: input.text.tokens.size,
