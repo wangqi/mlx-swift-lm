@@ -88,6 +88,9 @@ public struct GenerateParameters: Sendable {
     public var toolcallStartTag: String
     public var toolcallEndTag: String
 
+    // wangqi [2026-01-07] - External tool call parser
+    public var externalToolCallParser: (@Sendable (String) -> ToolCall?)?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -100,7 +103,8 @@ public struct GenerateParameters: Sendable {
         repetitionContextSize: Int = 20,
         prefillStepSize: Int = 512,
         toolcallStartTag: String = "<tool_call>",  // wangqi [2026-01-07]
-        toolcallEndTag: String = "</tool_call>"    // wangqi [2026-01-07]
+        toolcallEndTag: String = "</tool_call>",   // wangqi [2026-01-07]
+        externalToolCallParser: (@Sendable (String) -> ToolCall?)? = nil  // wangqi [2026-01-07]
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -114,6 +118,7 @@ public struct GenerateParameters: Sendable {
         self.prefillStepSize = prefillStepSize
         self.toolcallStartTag = toolcallStartTag  // wangqi [2026-01-07]
         self.toolcallEndTag = toolcallEndTag      // wangqi [2026-01-07]
+        self.externalToolCallParser = externalToolCallParser  // wangqi [2026-01-07]
     }
 
     public func sampler() -> LogitSampler {
@@ -807,7 +812,8 @@ public func generate(
     return generate(
         input: input, context: context, iterator: iterator,
         toolcallStartTag: parameters.toolcallStartTag,    // wangqi [2026-01-07]
-        toolcallEndTag: parameters.toolcallEndTag)        // wangqi [2026-01-07]
+        toolcallEndTag: parameters.toolcallEndTag,        // wangqi [2026-01-07]
+        externalToolCallParser: parameters.externalToolCallParser)  // wangqi [2026-01-07]
 }
 
 /// Low-level token generation using a ``TokenIterator``, returning an `AsyncStream<Generation>`.
@@ -818,12 +824,14 @@ public func generate(
 ///   - iterator: token iterator
 ///   - toolcallStartTag: start tag for tool calls (default: "<tool_call>")
 ///   - toolcallEndTag: end tag for tool calls (default: "</tool_call>")
+///   - externalToolCallParser: external parser closure for custom tool call formats (default: nil)
 /// - Returns: An `AsyncStream` that emits `Generation` values
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator,
     toolcallStartTag: String = "<tool_call>",   // wangqi [2026-01-07]
-    toolcallEndTag: String = "</tool_call>"     // wangqi [2026-01-07]
+    toolcallEndTag: String = "</tool_call>",    // wangqi [2026-01-07]
+    externalToolCallParser: ((String) -> ToolCall?)? = nil  // wangqi [2026-01-07]
 ) -> AsyncStream<Generation> {
 
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
@@ -841,8 +849,12 @@ public func generate(
 
         var tokenCount = 0
         var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
-        // wangqi [2026-01-07] - Use configurable tags
-        let toolCallProcessor = ToolCallProcessor(startTag: toolcallStartTag, endTag: toolcallEndTag)
+        // wangqi [2026-01-07] - Use configurable tags and external parser
+        let toolCallProcessor = ToolCallProcessor(
+            startTag: toolcallStartTag,
+            endTag: toolcallEndTag,
+            externalParser: externalToolCallParser
+        )
 
         for token in iterator {
 

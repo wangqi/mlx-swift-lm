@@ -11,11 +11,19 @@ public class ToolCallProcessor {
     private let startTagFirstChar: Character
     private let toolCallRegex: Regex<AnyRegexOutput>
 
+    // wangqi [2026-01-07] - External parser for custom formats
+    private let externalParser: ((String) -> ToolCall?)?
+
     // wangqi [2026-01-07] - Added configurable initializer
-    public init(startTag: String = "<tool_call>", endTag: String = "</tool_call>") {
+    public init(
+        startTag: String = "<tool_call>",
+        endTag: String = "</tool_call>",
+        externalParser: ((String) -> ToolCall?)? = nil
+    ) {
         self.toolUseStartTag = startTag
         self.toolUseEndTag = endTag
         self.startTagFirstChar = startTag.first ?? "<"
+        self.externalParser = externalParser
 
         // Build regex dynamically - escape special chars
         let escapedStart = NSRegularExpression.escapedPattern(for: startTag)
@@ -24,7 +32,7 @@ public class ToolCallProcessor {
         self.toolCallRegex = try! Regex(pattern)
 
         // wangqi [2026-01-07] - Debug log for initialization
-        print("[ToolCallProcessor] Initialized with startTag: '\(startTag)', endTag: '\(endTag)', pattern: '\(pattern)'")
+        print("[ToolCallProcessor] Initialized with startTag: '\(startTag)', endTag: '\(endTag)', pattern: '\(pattern)', externalParser: \(externalParser != nil)")
     }
 
     // Track the current state of processing
@@ -154,6 +162,12 @@ public class ToolCallProcessor {
 
     /// Parse a tool call from the content inside <tool_use> tags
     private func parseToolCall(_ content: String) -> ToolCall? {
+        // wangqi [2026-01-07] - Try external parser first if available
+        if let external = externalParser, let result = external(content) {
+            return result
+        }
+
+        // Fallback to internal JSON parsing
         guard let match = content.firstMatch(of: toolCallRegex) else { return nil }
 
         // wangqi [2026-01-07] - For Regex<AnyRegexOutput>, use subscript access
