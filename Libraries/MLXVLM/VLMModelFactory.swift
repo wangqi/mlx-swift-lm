@@ -48,10 +48,9 @@ public struct BaseProcessorConfiguration: Codable, Sendable {
 /// Creates a function that loads a configuration file and instantiates a model with the proper configuration
 private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
-) -> (URL) throws -> M {
-    { url in
-        let configuration = try JSONDecoder().decode(
-            C.self, from: Data(contentsOf: url))
+) -> (Data) throws -> M {
+    { data in
+        let configuration = try JSONDecoder().decode(C.self, from: data)
         return modelInit(configuration)
     }
 }
@@ -63,10 +62,9 @@ private func create<C: Codable, P>(
             C,
             any Tokenizer
         ) -> P
-) -> (URL, any Tokenizer) throws -> P {
-    { url, tokenizer in
-        let configuration = try JSONDecoder().decode(
-            C.self, from: Data(contentsOf: url))
+) -> (Data, any Tokenizer) throws -> P {
+    { data, tokenizer in
+        let configuration = try JSONDecoder().decode(C.self, from: data)
         return processorInit(configuration, tokenizer)
     }
 }
@@ -88,6 +86,8 @@ public enum VLMTypeRegistry {
         // TODO: see if we can make it work with fastvlm rather than llava_qwen2
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
+        "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
+        "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
     ])
 }
 
@@ -111,6 +111,10 @@ public enum VLMProcessorTypeRegistry {
             SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init),
         "FastVLMProcessor": create(
             FastVLMProcessorConfiguration.self, FastVLMProcessor.init),
+        "PixtralProcessor": create(
+            PixtralProcessorConfiguration.self, PixtralProcessor.init),
+        "Mistral3Processor": create(
+            Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
     ])
 }
 
@@ -153,6 +157,11 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let smolvlminstruct4bit = ModelConfiguration(
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"
+    )
+
+    static public let mistral3_3B_Instruct_4bit = ModelConfiguration(
+        id: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        defaultPrompt: ""
     )
 
     static public let gemma3_4B_qat_4bit = ModelConfiguration(
@@ -247,15 +256,18 @@ public final class VLMModelFactory: ModelFactory {
         let modelDirectory = try await downloadModel(
             hub: hub, configuration: configuration, progressHandler: progressHandler)
 
-        // load the generic config to understand which model and how to load the weights
-        let configurationURL = modelDirectory.appending(
-            component: "config.json"
-        )
-
+        // Load config.json once and decode for both base config and model-specific config
+        let configurationURL = modelDirectory.appending(component: "config.json")
+        let configData: Data
+        do {
+            configData = try Data(contentsOf: configurationURL)
+        } catch {
+            throw ModelFactoryError.configurationFileError(
+                configurationURL.lastPathComponent, configuration.name, error)
+        }
         let baseConfig: BaseConfiguration
         do {
-            baseConfig = try JSONDecoder().decode(
-                BaseConfiguration.self, from: Data(contentsOf: configurationURL))
+            baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -264,45 +276,81 @@ public final class VLMModelFactory: ModelFactory {
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: configurationURL, modelType: baseConfig.modelType)
+                configuration: configData, modelType: baseConfig.modelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // apply the weights to the bare model
+        // Load tokenizer, processor config, and weights in parallel using async let.
+        // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
+        // parallel scheduling. This may briefly block a cooperative thread pool thread,
+        // but the config file is small and model loading is not a high-concurrency path.
+        async let tokenizerTask = loadTokenizer(configuration: configuration, hub: hub)
+        async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
+
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization)
 
-        let tokenizer = try await loadTokenizer(
-            configuration: configuration,
-            hub: hub
-        )
-
-        let processorConfigurationURL = modelDirectory.appending(
-            component: "preprocessor_config.json"
-        )
-
+        let tokenizer = try await tokenizerTask
+        let processorConfigData: Data
         let baseProcessorConfig: BaseProcessorConfiguration
         do {
-            baseProcessorConfig = try JSONDecoder().decode(
-                BaseProcessorConfiguration.self,
-                from: Data(contentsOf: processorConfigurationURL)
-            )
-        } catch let error as DecodingError {
-            throw ModelFactoryError.configurationDecodingError(
-                processorConfigurationURL.lastPathComponent, configuration.name, error)
+            (processorConfigData, baseProcessorConfig) = try await processorConfigTask
+        } catch let error as ProcessorConfigError {
+            if let decodingError = error.underlying as? DecodingError {
+                throw ModelFactoryError.configurationDecodingError(
+                    error.filename, configuration.name, decodingError)
+            }
+            throw ModelFactoryError.configurationFileError(
+                error.filename, configuration.name, error.underlying)
         }
 
+        // Override processor type based on model type for models that need special handling
+        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
+        // to handle spatial merging correctly
+        let processorTypeOverrides: [String: String] = [
+            "mistral3": "Mistral3Processor"
+        ]
+        let processorType =
+            processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
+
         let processor = try await processorRegistry.createModel(
-            configuration: processorConfigurationURL,
-            processorType: baseProcessorConfig.processorClass, tokenizer: tokenizer)
+            configuration: processorConfigData,
+            processorType: processorType, tokenizer: tokenizer)
 
         return .init(
             configuration: configuration, model: model, processor: processor, tokenizer: tokenizer)
     }
 
+}
+
+/// Error wrapper that includes the filename for better error messages.
+private struct ProcessorConfigError: Error {
+    let filename: String
+    let underlying: Error
+}
+
+/// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
+/// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
+/// Throws ProcessorConfigError wrapping any underlying error with the filename.
+private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
+    Data, BaseProcessorConfiguration
+) {
+    let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
+    let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
+    let url =
+        FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
+        ? preprocessorConfigURL
+        : processorConfigURL
+    do {
+        let data = try Data(contentsOf: url)
+        let config = try JSONDecoder().decode(BaseProcessorConfiguration.self, from: data)
+        return (data, config)
+    } catch {
+        throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
+    }
 }
 
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {

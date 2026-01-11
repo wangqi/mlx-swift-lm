@@ -24,7 +24,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
-            revision: "573e5c9"
+            .upToNextMinor(from: "1.1.6")
         ),
     ],
     targets: [
@@ -100,6 +100,18 @@ let package = Package(
             exclude: [
                 "README.md"
             ],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .testTarget(
+            name: "Benchmarks",
+            dependencies: [
+                "MLXLLM",
+                "MLXVLM",
+                "MLXLMCommon",
+            ],
+            path: "Tests/Benchmarks",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
