@@ -563,8 +563,11 @@ public func generate(
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
     let tokens = MLXArray(promptTokens)
-    let iterator = try TokenIterator(
-        prompt: tokens, model: model, parameters: parameters)
+    // wangqi [2026-01-20] - Wrap TokenIterator creation with withError
+    let iterator = try withError {
+        try TokenIterator(
+            prompt: tokens, model: model, parameters: parameters)
+    }
 
     // this is a compatibility cover -- create the required values
     // for the iteration
@@ -597,8 +600,11 @@ public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
-    let iterator = try TokenIterator(
-        input: input, model: context.model, parameters: parameters)
+    // wangqi [2026-01-20] - Wrap TokenIterator creation with withError
+    let iterator = try withError {
+        try TokenIterator(
+            input: input, model: context.model, parameters: parameters)
+    }
     return generate(
         input: input, context: context, iterator: iterator, didGenerate: didGenerate)
 }
@@ -690,8 +696,11 @@ public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
     didGenerate: (Int) -> GenerateDisposition
 ) throws -> GenerateCompletionInfo {
-    let iterator = try TokenIterator(
-        input: input, model: context.model, parameters: parameters)
+    // wangqi [2026-01-20] - Wrap TokenIterator creation with withError
+    let iterator = try withError {
+        try TokenIterator(
+            input: input, model: context.model, parameters: parameters)
+    }
     return generate(
         input: input, context: context, iterator: iterator, didGenerate: didGenerate)
 }
@@ -807,8 +816,12 @@ public func generate(
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext
 ) throws -> AsyncStream<Generation> {
-    let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters)
+    // wangqi [2026-01-20] - Wrap TokenIterator creation with withError to catch MLX errors
+    // during prepare() which can trigger fatalError if not handled
+    let iterator = try withError {
+        try TokenIterator(
+            input: input, model: context.model, cache: cache, parameters: parameters)
+    }
     return generate(
         input: input, context: context, iterator: iterator,
         toolcallStartTag: parameters.toolcallStartTag,    // wangqi [2026-01-07]
@@ -856,45 +869,63 @@ public func generate(
             externalParser: externalToolCallParser
         )
 
-        for token in iterator {
+        // wangqi [2026-01-20] - Wrap token generation with withError to catch MLX errors
+        // instead of letting them call fatalError and crash the app
+        var mlxErrorMessage: String? = nil
+        do {
+            try withError { errorBox in
+                for token in iterator {
 
-            // Check for cancellation on every loop iteration.
-            if Task.isCancelled { break }
+                    // Check for cancellation on every loop iteration.
+                    if Task.isCancelled { break }
 
-            if promptTime == 0 {
-                let now = Date.timeIntervalSinceReferenceDate
-                promptTime = now - start
-                start = now
-            }
+                    // wangqi [2026-01-20] - Check for MLX errors during iteration
+                    try errorBox.check()
 
-            if token == context.tokenizer.unknownTokenId
-                || token == context.tokenizer.eosTokenId
-                || additionalEOSTokenIds.contains(token)
-            {
-                break
-            }
+                    if promptTime == 0 {
+                        let now = Date.timeIntervalSinceReferenceDate
+                        promptTime = now - start
+                        start = now
+                    }
 
-            detokenizer.append(token: token)
-            if let chunk = detokenizer.next() {
-                tokenCount += 1
+                    if token == context.tokenizer.unknownTokenId
+                        || token == context.tokenizer.eosTokenId
+                        || additionalEOSTokenIds.contains(token)
+                    {
+                        break
+                    }
 
-                // Process chunk through the tool call processor
-                if let textToYield = toolCallProcessor.processChunk(chunk) {
-                    continuation.yield(.chunk(textToYield))
+                    detokenizer.append(token: token)
+                    if let chunk = detokenizer.next() {
+                        tokenCount += 1
+
+                        // Process chunk through the tool call processor
+                        if let textToYield = toolCallProcessor.processChunk(chunk) {
+                            continuation.yield(.chunk(textToYield))
+                        }
+
+                        // Check if we have a complete tool call
+                        if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                            continuation.yield(.toolCall(toolCall))
+                        }
+                    }
                 }
-
-                // Check if we have a complete tool call
-                if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                    continuation.yield(.toolCall(toolCall))
-                }
             }
+        } catch {
+            // wangqi [2026-01-20] - Capture MLX error message for logging
+            mlxErrorMessage = error.localizedDescription
+            print("[MLXGenerate] MLX error caught during token generation: \(mlxErrorMessage ?? "unknown")")
         }
 
         let now = Date.timeIntervalSinceReferenceDate
         let generateTime = now - start
 
         // wangqi [2026-01-07] - Debug log for generation completion
-        print("[MLXGenerate] Generation complete. Tokens: \(tokenCount), Remaining tool calls: \(toolCallProcessor.toolCalls.count)")
+        if let errorMsg = mlxErrorMessage {
+            print("[MLXGenerate] Generation stopped due to error: \(errorMsg). Tokens generated: \(tokenCount)")
+        } else {
+            print("[MLXGenerate] Generation complete. Tokens: \(tokenCount), Remaining tool calls: \(toolCallProcessor.toolCalls.count)")
+        }
 
         let info = GenerateCompletionInfo(
             promptTokenCount: input.text.tokens.size,
