@@ -300,6 +300,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
+    // wangqi [2026-01-07] - Tool call configuration
+    let toolcallStartTag: String
+    let toolcallEndTag: String
+    let externalToolCallParser: (@Sendable (String) -> ToolCall?)?
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -324,6 +329,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+
+        // wangqi [2026-01-07] - Store tool call configuration
+        self.toolcallStartTag = parameters.toolcallStartTag
+        self.toolcallEndTag = parameters.toolcallEndTag
+        self.externalToolCallParser = parameters.externalToolCallParser
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -358,6 +368,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
+        // wangqi [2026-01-07] - Store tool call configuration
+        self.toolcallStartTag = parameters.toolcallStartTag
+        self.toolcallEndTag = parameters.toolcallEndTag
+        self.externalToolCallParser = parameters.externalToolCallParser
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
@@ -390,6 +405,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+
+        // wangqi [2026-01-07] - Use default tool call configuration
+        self.toolcallStartTag = "<tool_call>"
+        self.toolcallEndTag = "</tool_call>"
+        self.externalToolCallParser = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -626,11 +646,16 @@ public func generate(
     var start = Date.timeIntervalSinceReferenceDate
     var promptTime: TimeInterval = 0
 
-    let additionalEOSTokenIds = Set(
-        (context.configuration.extraEOSTokens)
-            .compactMap {
-                context.tokenizer.convertTokenToId($0)
-            })
+    // Build complete EOS token set from all sources
+    var eosTokenIds = context.configuration.eosTokenIds
+    if let tokenizerEos = context.tokenizer.eosTokenId {
+        eosTokenIds.insert(tokenizerEos)
+    }
+    for token in context.configuration.extraEOSTokens {
+        if let id = context.tokenizer.convertTokenToId(token) {
+            eosTokenIds.insert(id)
+        }
+    }
 
     var tokens = [Int]()
 
@@ -642,9 +667,7 @@ public func generate(
             start = now
         }
 
-        if token == context.tokenizer.unknownTokenId || token == context.tokenizer.eosTokenId
-            || additionalEOSTokenIds.contains(token)
-        {
+        if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
             break
         }
         tokens.append(token)
@@ -719,11 +742,16 @@ public func generate(
     var start = Date.timeIntervalSinceReferenceDate
     var promptTime: TimeInterval = 0
 
-    let additionalEOSTokenIds = Set(
-        (context.configuration.extraEOSTokens)
-            .compactMap {
-                context.tokenizer.convertTokenToId($0)
-            })
+    // Build complete EOS token set from all sources
+    var eosTokenIds = context.configuration.eosTokenIds
+    if let tokenizerEos = context.tokenizer.eosTokenId {
+        eosTokenIds.insert(tokenizerEos)
+    }
+    for token in context.configuration.extraEOSTokens {
+        if let id = context.tokenizer.convertTokenToId(token) {
+            eosTokenIds.insert(id)
+        }
+    }
 
     var tokenCount = 0
 
@@ -736,9 +764,7 @@ public func generate(
         }
 
         // Check for end-of-sequence tokens
-        if token == context.tokenizer.unknownTokenId || token == context.tokenizer.eosTokenId
-            || additionalEOSTokenIds.contains(token)
-        {
+        if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
             break
         }
 
@@ -770,6 +796,12 @@ public func generate(
 /// and then streams the token generation process via an `AsyncStream`. The resulting stream yields
 /// instances of the `Generation` enum, which can represent text chunks, tool calls, or summary
 /// completion information.
+///
+/// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
+/// using the model, parameters, KVCache, etc. for some time (typically a few ms).  This is typically OK for
+/// one-shot calls, but for "chat session" type calls consider using
+/// ``generateTask(promptTokenCount:context:iterator:)``
+/// so that the end of the generation task can be observed.
 ///
 /// - Parameters:
 ///   - input: The input for the language model.
@@ -809,11 +841,12 @@ public func generate(
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
-    return generate(
-        input: input, context: context, iterator: iterator,
-        toolcallStartTag: parameters.toolcallStartTag,    // wangqi [2026-01-07]
-        toolcallEndTag: parameters.toolcallEndTag,        // wangqi [2026-01-07]
-        externalToolCallParser: parameters.externalToolCallParser)  // wangqi [2026-01-07]
+    let (stream, _) = generateTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator)
+    return stream
 }
 
 /// Low-level token generation using a ``TokenIterator``, returning an `AsyncStream<Generation>`.
@@ -822,44 +855,79 @@ public func generate(
 ///   - input: prepared language model input
 ///   - context: model context (model and tokenizer)
 ///   - iterator: token iterator
-///   - toolcallStartTag: start tag for tool calls (default: "<tool_call>")
-///   - toolcallEndTag: end tag for tool calls (default: "</tool_call>")
-///   - externalToolCallParser: external parser closure for custom tool call formats (default: nil)
 /// - Returns: An `AsyncStream` that emits `Generation` values
+@available(
+    *, deprecated,
+    message: "use a higher level generate() call or use generateTask() for fine grained control"
+)
 public func generate(
     input: LMInput, context: ModelContext,
-    iterator: TokenIterator,
-    toolcallStartTag: String = "<tool_call>",   // wangqi [2026-01-07]
-    toolcallEndTag: String = "</tool_call>",    // wangqi [2026-01-07]
-    externalToolCallParser: ((String) -> ToolCall?)? = nil  // wangqi [2026-01-07]
+    iterator: TokenIterator
 ) -> AsyncStream<Generation> {
+    let (stream, _) = generateTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator)
+    return stream
+}
+
+/// Low-level token generation using a ``TokenIterator``, returning an
+/// `AsyncStream<Generation>` and a `Task`.
+///
+/// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
+/// using the model, parameters, KVCache, etc. for some time (typically a few ms).  Callers can await
+/// the `task` to observe when the use of the parameters is complete.
+///
+/// - Parameters:
+///   - promptTokenCount: number of tokens in the prompt
+///   - context: model context (model and tokenizer)
+///   - iterator: token iterator
+/// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
+public func generateTask(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming TokenIterator
+) -> (AsyncStream<Generation>, Task<Void, Never>) {
 
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
 
+    let iterator = SendableBox(iterator)
+
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
+        let iterator = iterator.consume()
+
         var start = Date.timeIntervalSinceReferenceDate
         var promptTime: TimeInterval = 0
 
-        let additionalEOSTokenIds = Set(
-            context.configuration.extraEOSTokens
-                .compactMap {
-                    context.tokenizer.convertTokenToId($0)
-                })
+        // Build complete EOS token set from all sources
+        var eosTokenIds = modelConfiguration.eosTokenIds
+        if let tokenizerEos = tokenizer.eosTokenId {
+            eosTokenIds.insert(tokenizerEos)
+        }
+        for token in modelConfiguration.extraEOSTokens {
+            if let id = tokenizer.convertTokenToId(token) {
+                eosTokenIds.insert(id)
+            }
+        }
 
         var tokenCount = 0
-        var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
-        // wangqi [2026-01-07] - Use configurable tags and external parser
+        var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        // wangqi [2026-01-07] - Use configurable tags and external parser from iterator
         let toolCallProcessor = ToolCallProcessor(
-            startTag: toolcallStartTag,
-            endTag: toolcallEndTag,
-            externalParser: externalToolCallParser
+            startTag: iterator.toolcallStartTag,
+            endTag: iterator.toolcallEndTag,
+            externalParser: iterator.externalToolCallParser
         )
 
         for token in iterator {
 
             // Check for cancellation on every loop iteration.
-            if Task.isCancelled { break }
+            if Task.isCancelled {
+                break
+            }
 
             if promptTime == 0 {
                 let now = Date.timeIntervalSinceReferenceDate
@@ -867,10 +935,7 @@ public func generate(
                 start = now
             }
 
-            if token == context.tokenizer.unknownTokenId
-                || token == context.tokenizer.eosTokenId
-                || additionalEOSTokenIds.contains(token)
-            {
+            if token == tokenizer.unknownTokenId || eosTokenIds.contains(token) {
                 break
             }
 
@@ -880,12 +945,16 @@ public func generate(
 
                 // Process chunk through the tool call processor
                 if let textToYield = toolCallProcessor.processChunk(chunk) {
-                    continuation.yield(.chunk(textToYield))
+                    if case .terminated = continuation.yield(.chunk(textToYield)) {
+                        break
+                    }
                 }
 
                 // Check if we have a complete tool call
                 if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                    continuation.yield(.toolCall(toolCall))
+                    if case .terminated = continuation.yield(.toolCall(toolCall)) {
+                        break
+                    }
                 }
             }
         }
@@ -897,7 +966,7 @@ public func generate(
         print("[MLXGenerate] Generation complete. Tokens: \(tokenCount), Remaining tool calls: \(toolCallProcessor.toolCalls.count)")
 
         let info = GenerateCompletionInfo(
-            promptTokenCount: input.text.tokens.size,
+            promptTokenCount: promptTokenCount,
             generationTokenCount: tokenCount,
             promptTime: promptTime + iterator.promptPrefillTime,
             generationTime: generateTime
@@ -916,7 +985,7 @@ public func generate(
         task.cancel()
     }
 
-    return stream
+    return (stream, task)
 }
 
 /// Represents metadata and statistics related to token generation.

@@ -26,7 +26,7 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.2")),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.3")),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.1.6")
@@ -111,6 +111,7 @@ let package = Package(
             exclude: [
                 "README.md"
             ],
+            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
