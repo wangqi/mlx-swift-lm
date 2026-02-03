@@ -2,64 +2,148 @@
 
 import Foundation
 
-/// Used to process generated text to detect tool calls and manage the generation flow
+/// Processes generated text to detect and extract tool calls during streaming generation.
+///
+/// `ToolCallProcessor` handles the streaming detection of tool calls in model output,
+/// buffering partial content and extracting complete tool calls when detected.
+///
+/// Example:
+/// ```swift
+/// let processor = ToolCallProcessor(format: .lfm2)
+/// for chunk in generatedChunks {
+///     if let text = processor.processChunk(chunk) {
+///         // Regular text to display
+///         print(text)
+///     }
+/// }
+/// // After generation completes:
+/// for toolCall in processor.toolCalls {
+///     // Handle extracted tool calls
+///     print(toolCall.function.name)
+/// }
+/// ```
 public class ToolCallProcessor {
 
-    // wangqi [2026-01-07] - Changed from static to instance for configurability
-    private let toolUseStartTag: String
-    private let toolUseEndTag: String
-    private let startTagFirstChar: Character
-    private let toolCallRegex: Regex<AnyRegexOutput>
+    // MARK: - Properties
 
-    // wangqi [2026-01-07] - External parser for custom formats
+    private let parser: any ToolCallParser
+    private let tools: [[String: any Sendable]]?
+    private var state = State.normal
+    private var toolCallBuffer = ""
+
+    // wangqi [2026-01-07] - External parser for app integration (overrides format parser)
     private let externalParser: ((String) -> ToolCall?)?
 
-    // wangqi [2026-01-07] - Added configurable initializer
-    public init(
-        startTag: String = "<tool_call>",
-        endTag: String = "</tool_call>",
-        externalParser: ((String) -> ToolCall?)? = nil
-    ) {
-        self.toolUseStartTag = startTag
-        self.toolUseEndTag = endTag
-        self.startTagFirstChar = startTag.first ?? "<"
-        self.externalParser = externalParser
+    /// The tool calls extracted during processing.
+    public var toolCalls: [ToolCall] = []
 
-        // Build regex dynamically - escape special chars
-        let escapedStart = NSRegularExpression.escapedPattern(for: startTag)
-        let escapedEnd = NSRegularExpression.escapedPattern(for: endTag)
-        let pattern = "\(escapedStart)\\s*(\\{.*?\\})\\s*\(escapedEnd)"
-        self.toolCallRegex = try! Regex(pattern)
+    // MARK: - State Enum
 
-        // wangqi [2026-01-07] - Debug log for initialization
-        print("[ToolCallProcessor] Initialized with startTag: '\(startTag)', endTag: '\(endTag)', pattern: '\(pattern)', externalParser: \(externalParser != nil)")
-    }
-
-    // Track the current state of processing
     private enum State {
         case normal
         case potentialToolCall
         case collectingToolCall
     }
 
-    private var state = State.normal
-    private var toolCallBuffer = ""
+    // MARK: - Initialization
 
-    /// The current parsed tool call, if any
-    public var toolCalls: [ToolCall] = []
+    /// Initialize with a specific tool call format.
+    /// - Parameters:
+    ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
+    ///   - tools: Optional tool schemas for type-aware parsing
+    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
+        self.parser = format.createParser()
+        self.tools = tools
+        self.externalParser = nil
+    }
 
-    // wangqi [2026-01-07] - Track accumulated text for debugging
-    private var accumulatedText = ""
+    // wangqi [2026-01-07] - Initializer with external parser for app integration
+    /// Initialize with external parser injection (for app integration).
+    /// - Parameters:
+    ///   - format: The tool call format to use (defaults to `.json`)
+    ///   - tools: Optional tool schemas for type-aware parsing
+    ///   - externalParser: Optional external parser that overrides the format parser
+    public init(
+        format: ToolCallFormat = .json,
+        tools: [[String: any Sendable]]? = nil,
+        externalParser: ((String) -> ToolCall?)? = nil
+    ) {
+        self.parser = format.createParser()
+        self.tools = tools
+        self.externalParser = externalParser
+    }
 
-    /// Append a generated text chunk and process for tool call tags
+    // wangqi [2026-02-03] - Initializer with custom tags for models with non-standard tags
+    /// Initialize with custom start/end tags and optional external parser.
+    /// Use this for models that use custom tool call tags.
+    /// - Parameters:
+    ///   - startTag: Custom start tag (e.g., "<|tool_call_start|>")
+    ///   - endTag: Custom end tag (e.g., "<|tool_call_end|>")
+    ///   - externalParser: Optional external parser that overrides the format parser
+    public init(
+        startTag: String,
+        endTag: String,
+        externalParser: ((String) -> ToolCall?)? = nil
+    ) {
+        self.parser = JSONToolCallParser(startTag: startTag, endTag: endTag)
+        self.tools = nil
+        self.externalParser = externalParser
+    }
+
+    // MARK: - Computed Properties
+
+    /// Whether this processor uses inline format (no start/end tags).
+    private var isInlineFormat: Bool {
+        parser.startTag == nil || parser.endTag == nil
+    }
+
+    /// The first character of the start tag for quick detection.
+    private var startTagFirstChar: Character? {
+        parser.startTag?.first
+    }
+
+    // MARK: - Public Methods
+
+    /// Process a generated text chunk and extract any tool call content.
     /// - Parameter chunk: The text chunk to process
-    /// - Returns: Any regular text that should be yielded (non-tool call content)
+    /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
     public func processChunk(_ chunk: String) -> String? {
-        // wangqi [2026-01-07] - Debug: track accumulated text
-        accumulatedText += chunk
+        if isInlineFormat {
+            return processInlineChunk(chunk)
+        }
+        return processTaggedChunk(chunk)
+    }
 
-        // wangqi [2026-01-07] - Use instance startTagFirstChar instead of hardcoded "<"
-        guard (state == .normal && chunk.contains(String(startTagFirstChar))) || state != .normal else {
+    // MARK: - Private Methods
+
+    /// Process chunk for inline formats (no wrapper tags).
+    private func processInlineChunk(_ chunk: String) -> String? {
+        toolCallBuffer += chunk
+
+        // wangqi [2026-01-07] - Try external parser first if available
+        if let external = externalParser, let toolCall = external(toolCallBuffer) {
+            toolCalls.append(toolCall)
+            toolCallBuffer = ""
+            return nil
+        } else if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+            toolCalls.append(toolCall)
+            toolCallBuffer = ""
+            return nil
+        }
+
+        // Return chunk as-is; caller handles incomplete inline tool calls
+        return chunk
+    }
+
+    /// Process chunk for tagged formats.
+    private func processTaggedChunk(_ chunk: String) -> String? {
+        guard let startTag = parser.startTag,
+            let startChar = startTagFirstChar
+        else {
+            return chunk
+        }
+
+        guard (state == .normal && chunk.contains(startChar)) || state != .normal else {
             return chunk
         }
 
@@ -74,14 +158,13 @@ public class ToolCallProcessor {
             // Change state to potential tool call
             state = .potentialToolCall
 
-            // wangqi [2026-01-07] - Use instance startTagFirstChar
-            leadingToken = separateToken(from: &toolCallBuffer, separator: String(startTagFirstChar), returnLeading: true)
+            leadingToken = separateToken(
+                from: &toolCallBuffer, separator: String(startChar), returnLeading: true)
 
             fallthrough
         case .potentialToolCall:
-            // wangqi [2026-01-07] - Use instance toolUseStartTag
-            if partialMatch(buffer: toolCallBuffer, tag: toolUseStartTag) {
-                if toolCallBuffer.starts(with: toolUseStartTag) {
+            if partialMatch(buffer: toolCallBuffer, tag: startTag) {
+                if toolCallBuffer.starts(with: startTag) {
                     state = .collectingToolCall
                     fallthrough
                 } else {
@@ -95,16 +178,21 @@ public class ToolCallProcessor {
                 return (leadingToken ?? "") + buffer
             }
         case .collectingToolCall:
-            // wangqi [2026-01-07] - Use instance toolUseEndTag
-            if toolCallBuffer.contains(toolUseEndTag) {
+            guard let endTag = parser.endTag else {
+                return nil
+            }
+
+            if toolCallBuffer.contains(endTag) {
                 // Separate the trailing token
                 let trailingToken = separateToken(
-                    from: &toolCallBuffer, separator: toolUseEndTag, returnLeading: false)
+                    from: &toolCallBuffer, separator: endTag, returnLeading: false)
 
-                // Parse the tool call
-                // wangqi [2026-01-07] - Debug log before parsing
+                // wangqi [2026-01-07] - Try external parser first, fallback to format parser
                 print("[ToolCallProcessor] Attempting to parse tool call from buffer: '\(toolCallBuffer)'")
-                if let toolCall = parseToolCall(toolCallBuffer) {
+                if let external = externalParser, let toolCall = external(toolCallBuffer) {
+                    toolCalls.append(toolCall)
+                    print("[ToolCallProcessor] Successfully parsed tool call (external): \(toolCall.function.name)")
+                } else if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
                     toolCalls.append(toolCall)
                     print("[ToolCallProcessor] Successfully parsed tool call: \(toolCall.function.name)")
                 } else {
@@ -114,8 +202,10 @@ public class ToolCallProcessor {
                 state = .normal
                 toolCallBuffer = ""
 
-                // wangqi [2026-01-07] - Use instance startTagFirstChar
-                if let trailingToken, trailingToken.contains(String(startTagFirstChar)) {
+                // If the token contains the start character, there may be more tool calls to come
+                if let trailingToken, let startChar = startTagFirstChar,
+                    trailingToken.contains(startChar)
+                {
                     return processChunk(trailingToken)
                 } else {
                     // Otherwise, return the collected token, or nil if it's empty
@@ -158,27 +248,5 @@ public class ToolCallProcessor {
         }
 
         return true
-    }
-
-    /// Parse a tool call from the content inside <tool_use> tags
-    private func parseToolCall(_ content: String) -> ToolCall? {
-        // wangqi [2026-01-07] - Try external parser first if available
-        if let external = externalParser, let result = external(content) {
-            return result
-        }
-
-        // Fallback to internal JSON parsing
-        guard let match = content.firstMatch(of: toolCallRegex) else { return nil }
-
-        // wangqi [2026-01-07] - For Regex<AnyRegexOutput>, use subscript access
-        guard match.output.count > 1,
-              let captured = match.output[1].substring else { return nil }
-        let jsonData = String(captured).data(using: .utf8)!
-
-        if let json = try? JSONDecoder().decode(ToolCall.Function.self, from: jsonData) {
-            return ToolCall(function: json)
-        } else {
-            return nil
-        }
     }
 }

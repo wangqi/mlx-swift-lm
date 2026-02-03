@@ -915,12 +915,21 @@ public func generateTask(
 
         var tokenCount = 0
         var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        // wangqi [2026-01-07] - Use configurable tags and external parser from iterator
-        let toolCallProcessor = ToolCallProcessor(
-            startTag: iterator.toolcallStartTag,
-            endTag: iterator.toolcallEndTag,
-            externalParser: iterator.externalToolCallParser
-        )
+        // wangqi [2026-02-03] - Support both format-based and custom tag approaches
+        let toolCallProcessor: ToolCallProcessor
+        if let externalParser = iterator.externalToolCallParser {
+            // Use custom tags with external parser (for app integration)
+            toolCallProcessor = ToolCallProcessor(
+                startTag: iterator.toolcallStartTag,
+                endTag: iterator.toolcallEndTag,
+                externalParser: externalParser
+            )
+        } else {
+            // Use format from model configuration (standard formats)
+            toolCallProcessor = ToolCallProcessor(
+                format: modelConfiguration.toolCallFormat ?? .json
+            )
+        }
 
         for token in iterator {
 
