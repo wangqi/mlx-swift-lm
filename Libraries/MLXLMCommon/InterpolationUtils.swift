@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 // MARK: - Kernel Sources
 
