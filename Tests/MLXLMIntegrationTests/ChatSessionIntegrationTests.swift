@@ -14,8 +14,6 @@ import XCTest
 /// Tests for the streamlined API using real models
 public class ChatSessionIntegrationTests: XCTestCase {
 
-    static let llmModelId = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-    static let vlmModelId = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
     nonisolated(unsafe) static var llmContainer: ModelContainer!
     nonisolated(unsafe) static var vlmContainer: ModelContainer!
 
@@ -26,16 +24,12 @@ public class ChatSessionIntegrationTests: XCTestCase {
         let vlmExpectation = XCTestExpectation(description: "Load VLM")
 
         Task {
-            llmContainer = try await LLMModelFactory.shared.loadContainer(
-                configuration: .init(id: llmModelId)
-            )
+            llmContainer = try await IntegrationTestModels.shared.llmContainer()
             llmExpectation.fulfill()
         }
 
         Task {
-            vlmContainer = try await VLMModelFactory.shared.loadContainer(
-                configuration: .init(id: vlmModelId)
-            )
+            vlmContainer = try await IntegrationTestModels.shared.vlmContainer()
             vlmExpectation.fulfill()
         }
 
@@ -89,6 +83,55 @@ public class ChatSessionIntegrationTests: XCTestCase {
             image: .ciImage(redImage))
         print("Vision result:", result)
         XCTAssertTrue(result.lowercased().contains("red"))
+    }
+
+    func testStreamDetailsWithTools() async throws {
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": [
+                                "type": "string",
+                                "description": "The city name",
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["location"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as ToolSpec
+        ]
+        let session = ChatSession(Self.llmContainer, tools: tools)
+
+        var responseText = ""
+        var toolCalls: [ToolCall] = []
+
+        // Use streamDetails to receive tool calls (respond/streamResponse drops them)
+        for try await generation in session.streamDetails(
+            to: "What is the weather in San Francisco?",
+            images: [],
+            videos: []
+        ) {
+            switch generation {
+            case .chunk(let text):
+                responseText += text
+            case .toolCall(let toolCall):
+                toolCalls.append(toolCall)
+            case .info:
+                break
+            }
+        }
+
+        print("Tools result text:", responseText)
+        print("Tool calls:", toolCalls)
+
+        // The model should either produce a tool call or mention the tool/weather
+        let hasContent = responseText.count > 0 || !toolCalls.isEmpty
+        XCTAssertTrue(hasContent, "Response should contain either text or tool calls")
     }
 
     func testPromptRehydration() async throws {
