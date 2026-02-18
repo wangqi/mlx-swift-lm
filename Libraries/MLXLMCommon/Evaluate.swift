@@ -84,13 +84,6 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for repetition penalty
     public var repetitionContextSize: Int
 
-    // wangqi [2026-01-07] - Tool call tag configuration
-    public var toolcallStartTag: String
-    public var toolcallEndTag: String
-
-    // wangqi [2026-01-07] - External tool call parser
-    public var externalToolCallParser: (@Sendable (String) -> ToolCall?)?
-
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -101,10 +94,7 @@ public struct GenerateParameters: Sendable {
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
-        prefillStepSize: Int = 512,
-        toolcallStartTag: String = "<tool_call>",  // wangqi [2026-01-07]
-        toolcallEndTag: String = "</tool_call>",   // wangqi [2026-01-07]
-        externalToolCallParser: (@Sendable (String) -> ToolCall?)? = nil  // wangqi [2026-01-07]
+        prefillStepSize: Int = 512
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -116,9 +106,6 @@ public struct GenerateParameters: Sendable {
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.prefillStepSize = prefillStepSize
-        self.toolcallStartTag = toolcallStartTag  // wangqi [2026-01-07]
-        self.toolcallEndTag = toolcallEndTag      // wangqi [2026-01-07]
-        self.externalToolCallParser = externalToolCallParser  // wangqi [2026-01-07]
     }
 
     public func sampler() -> LogitSampler {
@@ -300,11 +287,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
-    // wangqi [2026-01-07] - Tool call configuration
-    let toolcallStartTag: String
-    let toolcallEndTag: String
-    let externalToolCallParser: (@Sendable (String) -> ToolCall?)?
-
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -329,11 +311,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
-
-        // wangqi [2026-01-07] - Store tool call configuration
-        self.toolcallStartTag = parameters.toolcallStartTag
-        self.toolcallEndTag = parameters.toolcallEndTag
-        self.externalToolCallParser = parameters.externalToolCallParser
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -368,11 +345,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
-        // wangqi [2026-01-07] - Store tool call configuration
-        self.toolcallStartTag = parameters.toolcallStartTag
-        self.toolcallEndTag = parameters.toolcallEndTag
-        self.externalToolCallParser = parameters.externalToolCallParser
-
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
@@ -405,11 +377,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
-
-        // wangqi [2026-01-07] - Use default tool call configuration
-        self.toolcallStartTag = "<tool_call>"
-        self.toolcallEndTag = "</tool_call>"
-        self.externalToolCallParser = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)

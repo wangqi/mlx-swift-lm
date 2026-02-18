@@ -31,9 +31,6 @@ public class ToolCallProcessor {
     private var state = State.normal
     private var toolCallBuffer = ""
 
-    // wangqi [2026-01-07] - External parser for app integration (overrides format parser)
-    private let externalParser: ((String) -> ToolCall?)?
-
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
 
@@ -54,40 +51,6 @@ public class ToolCallProcessor {
     public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
         self.parser = format.createParser()
         self.tools = tools
-        self.externalParser = nil
-    }
-
-    // wangqi [2026-01-07] - Initializer with external parser for app integration
-    /// Initialize with external parser injection (for app integration).
-    /// - Parameters:
-    ///   - format: The tool call format to use (defaults to `.json`)
-    ///   - tools: Optional tool schemas for type-aware parsing
-    ///   - externalParser: Optional external parser that overrides the format parser
-    public init(
-        format: ToolCallFormat = .json,
-        tools: [[String: any Sendable]]? = nil,
-        externalParser: ((String) -> ToolCall?)? = nil
-    ) {
-        self.parser = format.createParser()
-        self.tools = tools
-        self.externalParser = externalParser
-    }
-
-    // wangqi [2026-02-03] - Initializer with custom tags for models with non-standard tags
-    /// Initialize with custom start/end tags and optional external parser.
-    /// Use this for models that use custom tool call tags.
-    /// - Parameters:
-    ///   - startTag: Custom start tag (e.g., "<|tool_call_start|>")
-    ///   - endTag: Custom end tag (e.g., "<|tool_call_end|>")
-    ///   - externalParser: Optional external parser that overrides the format parser
-    public init(
-        startTag: String,
-        endTag: String,
-        externalParser: ((String) -> ToolCall?)? = nil
-    ) {
-        self.parser = JSONToolCallParser(startTag: startTag, endTag: endTag)
-        self.tools = nil
-        self.externalParser = externalParser
     }
 
     // MARK: - Computed Properties
@@ -120,12 +83,7 @@ public class ToolCallProcessor {
     private func processInlineChunk(_ chunk: String) -> String? {
         toolCallBuffer += chunk
 
-        // wangqi [2026-01-07] - Try external parser first if available
-        if let external = externalParser, let toolCall = external(toolCallBuffer) {
-            toolCalls.append(toolCall)
-            toolCallBuffer = ""
-            return nil
-        } else if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+        if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
             toolCalls.append(toolCall)
             toolCallBuffer = ""
             return nil
@@ -146,9 +104,6 @@ public class ToolCallProcessor {
         guard (state == .normal && chunk.contains(startChar)) || state != .normal else {
             return chunk
         }
-
-        // wangqi [2026-01-07] - Debug log when potential tool call detected
-        print("[ToolCallProcessor] Potential tool call detected. Chunk: '\(chunk)', State: \(state), Buffer: '\(toolCallBuffer)')")
 
         toolCallBuffer += chunk
         var leadingToken: String?
@@ -187,16 +142,8 @@ public class ToolCallProcessor {
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separator: endTag, returnLeading: false)
 
-                // wangqi [2026-01-07] - Try external parser first, fallback to format parser
-                print("[ToolCallProcessor] Attempting to parse tool call from buffer: '\(toolCallBuffer)'")
-                if let external = externalParser, let toolCall = external(toolCallBuffer) {
+                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
                     toolCalls.append(toolCall)
-                    print("[ToolCallProcessor] Successfully parsed tool call (external): \(toolCall.function.name)")
-                } else if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    toolCalls.append(toolCall)
-                    print("[ToolCallProcessor] Successfully parsed tool call: \(toolCall.function.name)")
-                } else {
-                    print("[ToolCallProcessor] Failed to parse tool call from buffer")
                 }
 
                 state = .normal
