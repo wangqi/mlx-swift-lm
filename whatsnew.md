@@ -1,3 +1,322 @@
+# MLX-Swift-LM Update: tag-20260127 → tag-20260218
+
+**Update Date:** February 18, 2026
+**Previous Version:** tag-20260127
+**Current Version:** tag-20260218
+**New Commits (upstream):** 13 functional commits
+
+---
+
+## Executive Summary
+
+This update delivers two major architectural additions — **Wired Memory Control** and **Raw Token Streaming** — plus native function-calling support in `ChatSession`, a new Pythonic tool call parser, two new model families, and several important bug fixes.
+
+### Risk Assessment: **MEDIUM** ⚠️
+
+| Risk Area | Level | Reason |
+|-----------|-------|--------|
+| `Embedders` → `MLXEmbedders` rename | **HIGH** | Breaking import/target name change |
+| `generateLoopTask` architecture change | **HIGH** | Our `externalToolCallParser` injection is now dead code |
+| Wired Memory API | **LOW** | Opt-in, no breaking changes |
+| Raw Token Streaming | **LOW** | Additive API |
+| ChatSession tools | **LOW** | Additive parameter |
+| New models | **LOW** | Additive only |
+| Bug fixes | **LOW** | Safe improvements |
+
+---
+
+## Breaking Changes
+
+### 1. `Embedders` Library Renamed to `MLXEmbedders` (#102)
+
+**Impact: HIGH — requires build/package updates**
+
+The Swift package target `Embedders` has been renamed to `MLXEmbedders` and all source files have been physically relocated:
+
+```
+Libraries/Embedders/ → Libraries/MLXEmbedders/
+Libraries/Embedders/Bert.swift → Libraries/MLXEmbedders/Models/Bert.swift
+Libraries/Embedders/NomicBert.swift → Libraries/MLXEmbedders/Models/NomicBert.swift
+Libraries/Embedders/Qwen3.swift → Libraries/MLXEmbedders/Models/Qwen3.swift
+```
+
+**Action Required:**
+- Update any `import Embedders` → `import MLXEmbedders` in app code
+- Update `Package.swift` dependencies if referencing the target by name
+- Update Xcode project target membership for any files that were in the old path
+
+**Risk Level: HIGH**
+- Build will fail until imports are updated
+- No logic changes, purely a rename/reorganization
+
+---
+
+### 2. `generateLoopTask` Refactored — Our `externalToolCallParser` Is Now Dead Code
+
+**Impact: HIGH — our custom tool call injection no longer executes**
+
+The upstream introduced a `TokenLoopHandler` protocol and `TextToolTokenLoopHandler` struct that fully replace the old flat generation loop. Our wangqi [2026-01-07] custom code that injected `externalToolCallParser` into the generation loop was removed during the merge conflict resolution:
+
+**What we had (now gone from the loop):**
+```swift
+// wangqi [2026-01-07] - These properties exist but are no longer used in the loop
+iterator.toolcallStartTag
+iterator.toolcallEndTag
+iterator.externalToolCallParser
+```
+
+**What replaced it:**
+```swift
+// Upstream's TextToolTokenLoopHandler drives token processing now
+generateLoopTask(..., handler: TextToolTokenLoopHandler(tokenizer: tokenizer, format: format))
+```
+
+**Action Required:**
+- Audit `AIChatModelMLX.swift` — if it passes `externalToolCallParser` to `GenerateParameters`, that parser is currently NOT being called
+- Either: migrate to using `ToolCallFormat` enum (standard formats), OR
+- Update `TextToolTokenLoopHandler` to accept and delegate to an external parser when provided
+
+**Risk Level: HIGH**
+- Tool calls from MLX models may silently fail or produce incorrect output
+- No compiler error will catch this — it is a silent behavioral regression
+
+---
+
+## New Features
+
+### 3. Wired Memory Control (#72)
+
+**Impact: MEDIUM — opt-in, significant for memory-constrained iOS devices**
+
+New memory management system that pins model weights and KV caches in GPU-wired memory to prevent paging during inference on iOS 18 / macOS 15+.
+
+**New Files:**
+- `Libraries/MLXLMCommon/WiredMemoryPolicies.swift` (+182 lines)
+- `Libraries/MLXLMCommon/WiredMemoryUtils.swift` (+249 lines)
+
+**Key APIs:**
+
+```swift
+// Policy types
+WiredSumPolicy(cap: 12 * 1024 * 1024 * 1024)   // sum all active tickets
+WiredMaxPolicy(cap: ...)                         // use largest ticket only
+WiredFixedPolicy(limit: ...)                     // fixed limit
+
+// Measure actual model memory footprint
+let measurement = try await WiredMemoryUtils.measure(
+    model: model, context: context, tokenCount: 32)
+
+// Use during generation
+let ticket = policy.ticket(size: measurement.totalBytes, kind: .active)
+let stream = try generate(
+    input: lmInput, parameters: params, context: context,
+    wiredMemoryTicket: ticket)
+```
+
+**iOS-Specific Notes:**
+- Uses `GPU.maxRecommendedWorkingSetBytes()` as default cap (via `#if canImport(Metal)`)
+- Prevents iOS from evicting GPU memory mid-generation (reduces generation pauses)
+- On devices without Metal (or when policy is not set), falls back gracefully — fully opt-in
+- Recommended for models > 4B parameters on iPhone
+
+**Risk Level: LOW**
+- Fully opt-in; existing code paths are unchanged
+- `generate()` function gains an optional `wiredMemoryTicket` parameter (default `nil`)
+
+---
+
+### 4. Raw Token Streaming API (#88)
+
+**Impact: LOW — new additive API**
+
+Two new public functions for streaming raw token IDs instead of decoded text. Useful for downstream parsers that need token IDs directly (e.g., Harmony-style parsing, custom vocabularies).
+
+**New APIs:**
+```swift
+// Convenience: returns AsyncStream<TokenGeneration>
+func generateTokens(
+    input: LMInput, cache: [KVCache]? = nil,
+    parameters: GenerateParameters, context: ModelContext,
+    includeStopToken: Bool = false
+) throws -> AsyncStream<TokenGeneration>
+
+// Low-level: returns stream + Task (for observing completion)
+func generateTokensTask(...) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>)
+
+// New enum (mirrors Generation but yields Int IDs, not decoded text)
+public enum TokenGeneration: Sendable {
+    case token(Int)
+    case info(GenerateCompletionInfo)
+}
+```
+
+Also added `generateTask()` low-level function that returns `(AsyncStream<Generation>, Task<Void, Never>)` — allows observing when the underlying Task finishes (useful when consumer breaks early from stream).
+
+**iOS Impact:**
+- Enables custom token-level post-processing pipelines
+- `includeStopToken: true` mode lets consumers see the terminating EOS token
+
+**Risk Level: LOW** — additive only, no changes to existing `generate()` behavior
+
+---
+
+### 5. ChatSession Function Calling Support (#107)
+
+**Impact: LOW — additive parameter**
+
+`ChatSession` gains a `tools: [ToolSpec]?` parameter across all three initializers, enabling structured function calling without manually constructing the prompt:
+
+```swift
+let session = ChatSession(
+    model,
+    instructions: "You are a helpful assistant.",
+    tools: [myToolSpec]   // new
+)
+```
+
+**iOS Impact:**
+- Simplifies multi-turn tool-use conversations — tool schemas are passed once and maintained across turns
+- Works with all model types that support `ToolCallFormat`
+
+**Risk Level: LOW** — default is `nil`, no behavior change for existing sessions
+
+---
+
+### 6. Pythonic Tool Call Parser — LFM2.5 Support (#91)
+
+**Impact: LOW — new parser format**
+
+LFM2.5 (Liquid AI) outputs tool calls in Python-style list syntax rather than JSON:
+
+```
+[func(arg='value')]
+```
+
+New `PythonicToolCallParser` handles this format with prefix-match detection. Added to `ToolCallFormat` as a new case.
+
+**Files Added:**
+- `Libraries/MLXLMCommon/Tool/Parsers/PythonicToolCallParser.swift` (+100 lines)
+
+**Risk Level: LOW** — new format only, no impact on existing parsers
+
+---
+
+## New Model Support
+
+### 7. MiniMax and MiMo v2 Flash (#50)
+
+Two new model architectures added:
+
+| Model | File | Architecture Notes |
+|-------|------|--------------------|
+| **MiniMax** | `MiniMax.swift` (+340 lines) | Port of `minimax.py`, hybrid attention |
+| **MiMo v2 Flash** | `MiMoV2Flash.swift` (+556 lines) | Flash attention with sink tokens, port of `mimo_v2_flash.py` |
+
+Both registered in `LLMModelFactory.swift`.
+
+**Risk Level: LOW** — additive, no impact on existing models
+
+---
+
+### 8. GLM4 MOE Lite — KV Latent Cache (#73)
+
+`GLM4MOELite.swift` significantly enhanced (+216 lines) to store KV latent vectors in cache, matching the Python `glm4_moe_lite.py` implementation. Adds `MultiLinear` and `QuantizedMultiLinear` modules for proper quantized weight handling.
+
+**Performance Impact:** Better generation speed for GLM4 MOE models due to proper KV caching.
+
+**Risk Level: LOW** — existing GLM4 MOE users get improved performance
+
+---
+
+## Bug Fixes
+
+### 9. Gemma3 / Gemma3n Vocabulary Padding (#99)
+
+Gemma 3 12B+ models often ship weights with extra padding tokens (e.g., 262,208 entries vs. 262,144 expected), causing dimension mismatches on load. Fix trims the embedding matrix during `sanitize()`:
+
+```swift
+// Gemma3Text.swift and Gemma3nText.swift
+// Trims vocab to model's configured vocab_size to avoid shape mismatch
+```
+
+**iOS Impact:** Enables loading Gemma 3 12B quantized models that previously failed with a shape error.
+
+**Risk Level: LOW** — existing models unaffected; fixes a load-time crash for 12B variants
+
+---
+
+### 10. Mistral-Small-3.2 Loading Fix (#108)
+
+`Mistral3Text.swift` refactored to make `rope_theta` optional in `RopeScaling`, fixing a loading error for `Mistral-Small-3.2-24B-Instruct-2506-4bit` which omits this field from its config.
+
+**Risk Level: LOW** — fixes a crash-on-load for this specific model
+
+---
+
+## Documentation & Tooling
+
+- **Embedding model documentation** (#104): Clarifies how to load a specific embedding model by name
+- **MLXEmbedders README fix** (#103): Corrected code example in embedder README
+- **skill.md added** (#92): Developer reference for LLM usage patterns
+- **README snippet update**: Updated generation example in main README
+
+---
+
+## Our Integration — Action Items
+
+### Critical (fix before using MLX models):
+
+1. **Audit `externalToolCallParser` usage in `AIChatModelMLX.swift`**
+   - Check if the app passes a custom parser via `GenerateParameters`
+   - If yes: update `TextToolTokenLoopHandler` to accept and call the external parser, or switch to a registered `ToolCallFormat`
+   - If no: no action needed, but remove the dead properties to avoid confusion
+
+2. **Update any `import Embedders` to `import MLXEmbedders`**
+   - Search codebase for `Embedders` imports
+   - Update `Package.swift` target reference if needed
+
+### Recommended (before production):
+
+3. **Evaluate Wired Memory Control for iOS devices**
+   - Consider using `WiredSumPolicy` for models ≥ 4B parameters
+   - Run `WiredMemoryUtils.measure()` to profile actual model footprint
+   - Wrap `generate()` calls with `wiredMemoryTicket` for smoother generation on constrained devices
+
+4. **Test Gemma3 12B loading** — if using these models, the padding fix should resolve previous load failures
+
+5. **Test Mistral-Small-3.2 loading** — if used in model list
+
+---
+
+## Testing Checklist
+
+- [ ] **Tool calling** — verify MLX model tool calls still fire correctly after `externalToolCallParser` removal
+- [ ] **Embedder import** — build succeeds with `MLXEmbedders` name
+- [ ] **Gemma3 12B load** — model loads without shape mismatch error
+- [ ] **Mistral-Small-3.2 load** — model loads without `rope_theta` error
+- [ ] **Wired memory** — optionally enable and monitor generation smoothness on iOS
+- [ ] **ChatSession with tools** — test function calling via ChatSession API
+- [ ] **Raw token streaming** — if using `generateTokens`, test new API
+
+---
+
+## Overall Risk Rating
+
+**MEDIUM — upgrade with caution on tool-calling features**
+
+The library is safe to upgrade for standard text generation. The two high-risk items are both related to our own custom integration code (the `externalToolCallParser` silent removal and the embedder rename). Neither is a bug in the upstream library — they are integration points we own and need to update.
+
+The new Wired Memory feature is the most valuable addition for iOS device stability and should be evaluated for adoption on larger models.
+
+---
+
+**Generated:** 2026-02-18
+**Covers commits:** 13 upstream commits (tag-20260127 → tag-20260218)
+
+---
+
+---
+
 # MLX-Swift-LM Update: tag-20260111 → tag-20260203
 
 **Update Date:** February 3, 2026
