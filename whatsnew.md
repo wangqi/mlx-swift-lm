@@ -1,3 +1,132 @@
+# MLX-Swift-LM Update: tag-20260218 → tag-20260224
+
+**Update Date:** February 24, 2026
+**Previous Version:** tag-20260218
+**Current Version:** tag-20260224
+**New Commits (upstream):** 2 functional commits
+
+---
+
+## Executive Summary
+
+This is a **minor maintenance upgrade** with code quality improvements and one targeted bug fix. No new model architectures, features, or API changes. The changes focus on **concurrency safety** for the MLXEmbedders module and a **LoRA parameter initialization fix**.
+
+### Risk Assessment: **LOW** (1/5)
+
+| Risk Area | Level | Reason |
+|-----------|-------|--------|
+| LoRA parameter eval fix | **LOW** | Correctness fix, moves `eval()` after `self` assignment |
+| MLXEmbedders strict concurrency | **LOW** | Code style only, no behavioral change |
+| mlx-swift 0.30.3 → 0.30.6 | **LOW** | Patch-level bump, same minor version |
+| API breaking changes | **NONE** | No public API modifications |
+
+---
+
+## Commits Included
+
+| Commit | Author | Date | Description |
+|--------|--------|------|-------------|
+| `7e19e09` | David Koski | 2026-02-18 | switch to current mlx-swift (#100) |
+| `a3e1bf4` | Christoph Rohde | 2026-02-19 | Enforce structured concurrency for MLXEmbedders (#111) |
+
+---
+
+## Change Details
+
+### 1. mlx-swift Dependency Update (0.30.3 → 0.30.6)
+
+**PR #100** — Updates the core `mlx-swift` framework dependency.
+
+- **What changed**: `Package.swift` dependency bumped from `0.30.3` to `0.30.6`
+- **Why**: Incorporates upstream fixes from mlx-swift, including fix for issue #94 (reported as a correctness/stability bug)
+- **Impact**: Patch-level bump within the same minor version — includes bug fixes and stability improvements in the underlying MLX computation engine
+- **Co-authored-by**: mattt, atdrendel
+
+### 2. LoRA Parameter Evaluation Fix
+
+**PR #100** — Fixes parameter evaluation order in `LoRAContainer`.
+
+- **File**: `Libraries/MLXLMCommon/Adapters/LoRA/LoRAContainer.swift`
+- **What changed**: `eval(parameters)` moved to **after** assignment to `self.parameters` (was called before assignment)
+- **Why**: Parameters must be assigned to `self` before `eval()` to ensure they are fully evaluated as a property of the container, not as a consuming parameter about to be moved
+- **Impact**: Fixes potential issues with LoRA adapter parameter initialization where parameters could be evaluated before being properly owned by the container
+- **Lines changed**: 3 lines moved (no logic change, just reordering)
+
+### 3. MLXEmbedders Strict Concurrency Enforcement
+
+**PR #111** — Enables Swift strict concurrency checking for the MLXEmbedders target.
+
+- **Package.swift**: Added `.enableExperimentalFeature("StrictConcurrency")`
+- **Refactored files**:
+  - `Bert.swift` — `BertModel.sanitize(weights:)` and `DistilBertModel.sanitize(weights:)`: mutable `var key` replaced with immutable `let key` using chained `.replacingOccurrences()` calls
+  - `NomicBert.swift` — `NomicBertModel.sanitize(weights:)`: same var → let refactor
+  - `BertConfiguration.init(from:)` — decoder code reformatted for readability (shorter lines, removed redundant `.self` on CodingKeys)
+- **Why**: Enforces thread safety at compile time, eliminating potential data races in embedder weight sanitization
+- **Impact**: **No behavioral change** — the weight key remapping logic produces identical results. This is purely a code quality/safety improvement
+
+---
+
+## Files Changed
+
+| File | Changes | Type |
+|------|---------|------|
+| `Libraries/MLXEmbedders/Models/Bert.swift` | -92 / +56 | Refactor (code style) |
+| `Libraries/MLXEmbedders/Models/NomicBert.swift` | -9 / +15 | Refactor (code style) |
+| `Libraries/MLXLMCommon/Adapters/LoRA/LoRAContainer.swift` | -3 / +3 | Bug fix |
+| `Package.swift` | +3 | Config (strict concurrency) |
+
+**Total**: 4 files changed, 89 insertions, 125 deletions (net -36 lines)
+
+---
+
+## iOS Device Impact
+
+- **No iOS-specific changes** in this upgrade
+- The mlx-swift 0.30.6 update may include Metal shader optimizations benefiting iOS GPU inference, but no iOS-specific code paths were modified in mlx-swift-lm itself
+- LoRA fix applies equally to iOS and macOS
+- Strict concurrency improvements help prevent threading issues on all platforms
+
+---
+
+## Our Integration — Action Items
+
+### Required: **NONE**
+
+No code changes required in the main AIAssistant project. This is a drop-in replacement.
+
+### Recommended Testing
+
+1. **Build verification** — Ensure the project compiles cleanly with the new mlx-swift 0.30.6 dependency
+2. **MLX model inference** — Run a basic MLX model chat to verify inference works
+3. **LoRA adapters** (if used) — Test loading a LoRA adapter to verify the parameter eval fix
+4. **Embedders** (if used) — Test Bert/NomicBert embedding generation if the app uses MLXEmbedders
+
+---
+
+## Testing Checklist
+
+- [ ] Project builds successfully with updated submodule
+- [ ] MLX model text generation works (basic chat)
+- [ ] LoRA adapter loading (if applicable)
+- [ ] No runtime warnings or crashes from concurrency changes
+
+---
+
+## Overall Risk Rating
+
+**LOW — safe to upgrade**
+
+This is a minimal maintenance update with no API changes, no new features, and no architectural modifications. The only behavioral change is the LoRA parameter eval ordering fix, which is a correctness improvement. All other changes are code style reformatting for strict concurrency compliance.
+
+---
+
+**Generated:** 2026-02-24
+**Covers commits:** 2 upstream commits (tag-20260218 → tag-20260224)
+
+---
+
+---
+
 # MLX-Swift-LM Update: tag-20260127 → tag-20260218
 
 **Update Date:** February 18, 2026
