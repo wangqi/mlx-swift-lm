@@ -1,178 +1,92 @@
-# MLX-Swift-LM Update: tag-20260224 → tag-20260302
+# MLX-Swift-LM Upgrade: tag-20260302 to tag-20260309
 
-**Update Date:** March 2, 2026
-**Previous Version:** tag-20260224
-**Current Version:** tag-20260302
-**New Commits (upstream):** 4 commits (3 functional + 1 merge)
+## Summary
 
----
-
-## Executive Summary
-
-This is a **low-risk maintenance update** with two targeted bug fixes, one new model family (Qwen3.5 / Qwen3.5 MoE), and a minor API enhancement for wired memory. No breaking changes, no architecture refactoring.
-
-### Risk Assessment: **LOW** (1/5)
-
-| Risk Area | Level | Reason |
-|-----------|-------|--------|
-| KVCache serialization fix | **LOW** | Correctness fix; restores Python cross-platform compatibility |
-| LFM2 nested RoPE params fix | **LOW** | Load-time fix for specific LFM2 variants |
-| Qwen3.5 / Qwen3.5 MoE models | **LOW** | Additive only; no impact on existing models |
-| `wiredMemoryTicket` on `generateTokens` | **LOW** | Optional parameter, default `nil`; existing code unchanged |
-| API breaking changes | **NONE** | No public API modifications |
+11 commits merged from upstream `ml-explore/mlx-swift-lm`. Key themes:
+**Qwen3.5 vision support, tool-call reliability, RoPE consolidation, JSON5 config parsing, and Swift Concurrency cleanup.**
 
 ---
 
-## Commits Included
+## New Features
 
-| Commit | Author | Date | Description |
-|--------|--------|------|-------------|
-| `84213e5` | Ronald Mannak | 2026-02-27 | Add wiredMemoryTicket to GenerateTokens (#117) |
-| `72e929a` | John Mai | 2026-02-28 | Add Qwen3.5 and Qwen3.5 MoE (#97) |
-| `b08c1b2` | Adrien Grondin | 2026-02-27 | Allow reading LFM2 models nested rope params (#122) |
-| `11968af` | Ivan Petrukha | 2026-02-27 | Fix KVCache serialization (#121) |
+### Qwen3.5 Vision-Language Models (VLM)
+- **Commit**: `7da3344` — Adding Support for Qwen3.5 and Qwen3.5 MoE (Vision)
+- Full Qwen3.5 VLM implementation added (`MLXVLM/Models/Qwen35.swift`, 1252 lines)
+- Qwen3.5 MoE vision variant added (`MLXVLM/Models/Qwen35MoE.swift`)
+- Registered in `VLMModelFactory.swift` (two new model type entries)
+- **Impact**: iPhone/iPad users can now run Qwen3.5 vision models locally via MLX
 
----
+### Qwen3.5 Text-Only Model Type Registration Fix
+- **Commit**: `06bfeed` — Add qwen3_5_text model type support
+- Registers `qwen3_5_text` in `LLMTypeRegistry` using `Qwen35TextConfiguration` / `Qwen35TextModel`
+- Fixes: "Unsupported model type: qwen3_5_text" crash when loading text-only Qwen 3.5 models
+- **Impact**: Critical fix for any user loading Qwen 3.5 text models on iOS
 
-## Change Details
+### JSON5 Config Support
+- **Commit**: `3a7f2b1` — Add JSON5 support
+- New `JSONDecoder+JSON5.swift` extension; `MLXEmbedders`, `MLXLLM`, and `MLXVLM` factories all use JSON5 parsing
+- Allows comments and trailing commas in `config.json` / `tokenizer_config.json`
+- **Impact**: Broader compatibility with HuggingFace model configs that use JSON5 conventions
 
-### 1. KVCache Serialization Fix (#121)
-
-**Files:** `Libraries/MLXLMCommon/KVCache.swift`, `Tests/MLXLMTests/KVCacheTests.swift`
-
-- **Root cause**: `BaseKVCache.metaState` getter returned `[]` (Swift empty array) but Python's base class returns `[""]` (array with one empty string). This caused Python ↔ Swift cross-platform serialization to mismatch when saving/loading prompt caches.
-- **Fix 1**: `BaseKVCache.metaState` getter now returns `[""]` to match Python behavior.
-- **Fix 2**: `ChunkedKVCache` type check in `savePromptCache()` moved before `KVCacheSimple` in the `switch` statement — required because `ChunkedKVCache` inherits from `KVCacheSimple`, so the subclass must be matched first.
-- **Fix 3**: Removed redundant `KVCacheSimple.metaState` override (now handled by base class correctly).
-- **Fix 4**: Loaded metadata made non-optional for cleaner API.
-- **New tests**: `KVCacheTests.swift` gains serialization round-trip tests.
-
-**iOS Device Impact:**
-- Fixes potential prompt cache corruption when saving/restoring KV caches across sessions (prompt caching feature)
-- No impact if prompt caching is not used
-
-**Risk Level: LOW** — pure correctness fix, no behavioral change for uncached generation
+### Optional Tool-Call Dispatch and Output Injection
+- **Commit**: `0840626` — add optional toolCall dispatch and tool output injection
+- `ChatSession.swift` refactored to support optional tool-call handler dispatch and injecting tool outputs back into the generation stream
+- Enables frameworks built on `ChatSession` to handle tool calls natively without re-implementing session state
 
 ---
 
-### 2. LFM2 / LFM2 MoE Nested RoPE Params Fix (#122)
+## Bug Fixes
 
-**Files:** `Libraries/MLXLLM/Models/LFM2.swift`, `Libraries/MLXLLM/Models/LFM2MoE.swift`
+### XML Function Parser: Newline Support for Tool Calls
+- **Commit**: `e33eba8` — Fix XMLFunctionParser regex to match newlines
+- Swift/ICU regex `.` does not match `\n`; replaced with `[\s\S]` (equivalent to Python `re.DOTALL`)
+- Models like Qwen3.5 generate newlines between XML function tags, causing silent parse failures
+- **Impact**: Tool calls from Qwen3.5 now parse correctly; previously they were silently dropped
 
-- **What changed**: Both `LFM2` and `LFM2MoE` models can now read RoPE (Rotary Position Embedding) parameters from nested config structures in addition to the flat layout.
-- **Why**: Some published LFM2 model variants ship `rope_theta` and related values nested inside a sub-object rather than at the top level. The parser previously silently ignored them, leading to incorrect positional encoding and degraded output quality.
+### Qwen3VL: Pass additionalContext Correctly
+- **Commit**: `0ef0e10` — Pass additionalContext to Qwen3VL
+- `Qwen3VL.swift` was not forwarding `additionalContext` to the generation pipeline
+- **Impact**: Multi-turn Qwen3 VL conversations now receive correct context
 
-**iOS Device Impact:**
-- Fixes loading errors / poor output quality for affected LFM2 model variants
-- Existing correctly-formatted LFM2 models are unaffected
+### RoPE Configuration Audit (30 files)
+- **Commit**: `6bb84aa` — audit RoPE use across models
+- Unified RoPE layer implementation across 25+ models (Llama, Qwen, OLMo, OLMoE, DeepSeek V3, Mistral 3, Granite, etc.)
+- Fixed bugs in RoPE config decoding; models now match upstream Python `mlx-lm` behavior
+- New `RoPELayer` / `ArrayOffsetLayer` protocol for cleaner batch RoPE API
+- Net code reduction: 901 lines removed, 248 added
+- **Impact**: Fixes potential numerical differences; improves generation correctness for affected model families
 
-**Risk Level: LOW** — load-time config parsing fix only
-
----
-
-### 3. Qwen3.5 and Qwen3.5 MoE Model Support (#97)
-
-**Files Added:**
-- `Libraries/MLXLLM/Models/Qwen35.swift` (+683 lines) — full Qwen3.5 text model
-- `Libraries/MLXLLM/Models/Qwen35MoE.swift` (+75 lines) — Qwen3.5 Mixture-of-Experts variant
-- `Libraries/MLXLLM/Models/Qwen3Next.swift` — minor update (+10/-6)
-- `Libraries/MLXLLM/LLMModelFactory.swift` — registered both new model types
-
-**Architecture Notes (Qwen3.5):**
-- Separate `Qwen35Configuration` / `Qwen35TextConfiguration` codable structs
-- Architecture type strings: `"qwen3_5"` and `"qwen3_5_moe"`
-- MoE variant reuses the `Qwen35Configuration` config with sparse expert routing
-
-**iOS Device Impact:**
-- Qwen3.5 and Qwen3.5 MoE models can now be loaded and run via the MLX inference engine
-- Smaller Qwen3.5 variants (0.6B, 1.7B, 4B) are well-suited for iPhone 15 Pro and above
-
-**Risk Level: LOW** — additive only; zero impact on existing models
+### Qwen3.5 Performance Optimization
+- **Commit**: `1062897` — Qwen3.5 performance optimization
+- `GatedDelta` layer extracted from `Qwen3Next.swift` into shared `GatedDelta.swift`
+- Reduces duplication between `Qwen3Next` and `Qwen35`
 
 ---
 
-### 4. wiredMemoryTicket Added to generateTokens (#117)
+## Maintenance
 
-**Files:** `Libraries/MLXLMCommon/Evaluate.swift`
+### Swift Concurrency / Sendable Cleanup
+- **Commit**: `6d36ed9` — fix Sendable issues, unused code, deprecation warnings
+- Fixed `@Sendable` conformance gaps in `ModelContainer`, tool parsers, and VLM models
+- **Impact**: Cleaner compiler output; reduces data-race warnings on Swift 6
 
-- **What changed**: Both `generateTokens()` and `generateTokensTask()` gain a new optional parameter:
-  ```swift
-  wiredMemoryTicket: WiredMemoryTicket? = nil
-  ```
-- **Why**: The wired memory control system (introduced in tag-20260127) already supported the high-level `generate()` function. This change brings the same wired memory policy coordination to the lower-level raw token streaming API, enabling consistent memory management across both code paths.
-- **Supported platforms**: macOS 15 / iOS 18 / tvOS 18 or newer (GPU devices with wired memory control). Falls back gracefully on older systems or when `nil` (default).
-
-**iOS Device Impact:**
-- Enables smoother, pause-free generation for callers using the raw token streaming API
-- Only beneficial when a `WiredMemoryTicket` from an active policy is passed
-- Default behavior (`nil`) is identical to before — no change required
-
-**Risk Level: LOW** — opt-in parameter, default `nil`, no behavioral change for existing callers
+### swift-transformers 1.1.9 Dependency Bump
+- **Commit**: `a7be758` — Pick up swift-transformers 1.1.9
+- Picks up tokenizer fixes from the swift-transformers library
 
 ---
 
-## Files Changed Summary
+## Risk Assessment
 
-| File | Change Type | Lines |
-|------|-------------|-------|
-| `Libraries/MLXLMCommon/KVCache.swift` | Bug fix | -19 / +13 |
-| `Tests/MLXLMTests/KVCacheTests.swift` | New tests | +45 |
-| `Libraries/MLXLLM/Models/LFM2.swift` | Bug fix | +7 / -1 |
-| `Libraries/MLXLLM/Models/LFM2MoE.swift` | Bug fix | +7 / -1 |
-| `Libraries/MLXLLM/Models/Qwen35.swift` | New model | +683 |
-| `Libraries/MLXLLM/Models/Qwen35MoE.swift` | New model | +75 |
-| `Libraries/MLXLLM/Models/Qwen3Next.swift` | Minor update | +10 / -6 |
-| `Libraries/MLXLLM/LLMModelFactory.swift` | Registration | +2 |
-| `Libraries/MLXLMCommon/Evaluate.swift` | Enhancement | +32 / -4 |
+| Area | Risk Level | Notes |
+|------|-----------|-------|
+| RoPE audit (30 files) | **Medium** | Large refactor across 25+ models. Generation quality may differ slightly; unlikely to crash. Test Llama, Qwen3, DeepSeek V3, OLMo 2 after upgrade. |
+| Qwen3.5 text type fix | **Low** | Additive registration fix; other models unaffected. |
+| Qwen3.5 VLM | **Low** | New code path; existing VLM models unchanged. |
+| XMLFunctionParser fix | **Low** | Regex-only change; adds newline support without breaking other models. |
+| JSON5 support | **Low** | Additive; falls back gracefully if no JSON5 features used. |
+| ChatSession tool dispatch | **Low-Medium** | Refactored existing `ChatSession`; integration tests added. |
+| swift-transformers bump | **Low** | Minor version bump with tokenizer fixes. |
+| Sendable cleanup | **Low** | No behavioral change expected. |
 
-**Total**: 9 files changed, ~875 insertions, ~32 deletions
-
----
-
-## iOS Device Impact Summary
-
-| Change | iOS Benefit | Action Required |
-|--------|-------------|-----------------|
-| KVCache serialization fix | Prompt cache save/load now correct | None |
-| LFM2 nested RoPE fix | LFM2 variants load without errors | None |
-| Qwen3.5 support | New small/medium models available | Add to models.json if desired |
-| wiredMemoryTicket on generateTokens | Memory-stable raw token streaming | None (opt-in) |
-
----
-
-## Our Integration — Action Items
-
-### Required: **NONE**
-
-This is a drop-in replacement. No code changes required in AIAssistant.
-
-### Optional — Qwen3.5 Models
-
-If desired, add Qwen3.5 model entries to `helper/models_*.json`:
-- Architecture type: `"qwen3_5"` or `"qwen3_5_moe"`
-- Inference: `"mlx"` (MLX-Swift engine)
-- Recommended small variants: 0.6B, 1.7B (good for iPhone)
-
----
-
-## Testing Checklist
-
-- [ ] Project builds successfully with updated submodule
-- [ ] MLX model text generation works (basic chat)
-- [ ] (Optional) Load an LFM2 model variant — verify clean load
-- [ ] (Optional) Qwen3.5 model chat if model file is available
-- [ ] No runtime warnings or crashes
-
----
-
-## Overall Risk Rating
-
-**LOW — safe to upgrade**
-
-Three of four changes are pure correctness fixes or additive model support. The `generateTokens` API addition is strictly backward-compatible (new optional parameter, default `nil`). No architecture changes, no import renames, no behavioral regressions.
-
----
-
-**Generated:** 2026-03-02
-**Covers commits:** 3 upstream functional commits (tag-20260224 → tag-20260302)
-
+**Overall upgrade risk: LOW-MEDIUM.** The RoPE audit touches the most files but is well-validated upstream. The Qwen3.5 text model type fix and XML tool-call parser fix are important correctness improvements.
