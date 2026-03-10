@@ -14,14 +14,32 @@ public enum Chat {
         /// Array of video data associated with the message.
         public var videos: [UserInput.Video]
 
+        // wangqi modified 2026-03-10: Add optional tool call fields to support multi-turn tool calling
+        // via Chat.Message API. toolCalls enables assistant messages with tool call requests;
+        // toolCallId/name enable tool result messages. All fields default to nil for backward compatibility.
+        /// Tool calls requested by the assistant (for assistant messages with tool calls).
+        public var toolCalls: [[String: any Sendable]]?
+
+        /// The tool call ID this message is responding to (for tool result messages).
+        public var toolCallId: String?
+
+        /// The name of the tool (for tool result messages).
+        public var name: String?
+
         public init(
             role: Role, content: String, images: [UserInput.Image] = [],
-            videos: [UserInput.Video] = []
+            videos: [UserInput.Video] = [],
+            toolCalls: [[String: any Sendable]]? = nil,
+            toolCallId: String? = nil,
+            name: String? = nil
         ) {
             self.role = role
             self.content = content
             self.images = images
             self.videos = videos
+            self.toolCalls = toolCalls
+            self.toolCallId = toolCallId
+            self.name = name
         }
 
         public static func system(
@@ -30,10 +48,12 @@ public enum Chat {
             Self(role: .system, content: content, images: images, videos: videos)
         }
 
+        // wangqi modified 2026-03-10: Added toolCalls parameter so assistant messages can carry tool call requests.
         public static func assistant(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = [],
+            toolCalls: [[String: any Sendable]]? = nil
         ) -> Self {
-            Self(role: .assistant, content: content, images: images, videos: videos)
+            Self(role: .assistant, content: content, images: images, videos: videos, toolCalls: toolCalls)
         }
 
         public static func user(
@@ -42,8 +62,12 @@ public enum Chat {
             Self(role: .user, content: content, images: images, videos: videos)
         }
 
-        public static func tool(_ content: String) -> Self {
-            Self(role: .tool, content: content)
+        // wangqi modified 2026-03-10: Added toolCallId/name parameters to tool() so tool result messages
+        // carry the required metadata for multi-turn tool call history replay.
+        public static func tool(
+            _ content: String, toolCallId: String? = nil, name: String? = nil
+        ) -> Self {
+            Self(role: .tool, content: content, toolCallId: toolCallId, name: name)
         }
 
         public enum Role: String, Sendable {
@@ -87,15 +111,24 @@ extension MessageGenerator {
         ]
     }
 
+    // wangqi modified 2026-03-10: Override generate(messages:) default implementation to centrally inject
+    // tool call fields (tool_calls, tool_call_id, name) after each model-specific generate(message:) call.
+    // This avoids duplicating tool field injection in every VLM/LLM MessageGenerator subclass.
     public func generate(messages: [Chat.Message]) -> [Message] {
-        var rawMessages: [Message] = []
-
-        for message in messages {
-            let raw = generate(message: message)
-            rawMessages.append(raw)
+        messages.map { message in
+            var raw = generate(message: message)
+            // Inject tool-related fields that model-specific generators don't handle
+            if let toolCalls = message.toolCalls {
+                raw["tool_calls"] = toolCalls
+            }
+            if let toolCallId = message.toolCallId {
+                raw["tool_call_id"] = toolCallId
+            }
+            if let name = message.name {
+                raw["name"] = name
+            }
+            return raw
         }
-
-        return rawMessages
     }
 
     public func generate(from input: UserInput) -> [Message] {
