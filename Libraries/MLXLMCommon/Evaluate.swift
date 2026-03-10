@@ -832,9 +832,11 @@ public func generate(
 ///     }
 /// }
 /// ```
+// wangqi modified 2026-03-10: added fallbackToolCallParser to bridge app-level parsers
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    fallbackToolCallParser: (any ToolCallParser)? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
@@ -843,7 +845,8 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemoryTicket: wiredMemoryTicket)
+        wiredMemoryTicket: wiredMemoryTicket,
+        fallbackToolCallParser: fallbackToolCallParser)
     return stream
 }
 
@@ -886,12 +889,14 @@ public func generate(
 ///   - iterator: token iterator
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
+// wangqi modified 2026-03-10: added fallbackToolCallParser to bridge app-level parsers
 public func generateTask(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    fallbackToolCallParser: (any ToolCallParser)? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -901,7 +906,8 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            fallbackParser: fallbackToolCallParser
         )
     )
 }
@@ -1308,9 +1314,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     var detokenizer: NaiveStreamingDetokenizer
     let toolCallProcessor: ToolCallProcessor
 
-    init(tokenizer: Tokenizer, format: ToolCallFormat) {
+    // wangqi modified 2026-03-10: added fallbackParser
+    init(tokenizer: Tokenizer, format: ToolCallFormat, fallbackParser: (any ToolCallParser)? = nil) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format)
+        toolCallProcessor = ToolCallProcessor(format: format, fallbackParser: fallbackParser)
     }
 
     mutating func onToken(

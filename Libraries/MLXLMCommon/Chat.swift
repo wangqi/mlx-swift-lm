@@ -115,7 +115,7 @@ extension MessageGenerator {
     // tool call fields (tool_calls, tool_call_id, name) after each model-specific generate(message:) call.
     // This avoids duplicating tool field injection in every VLM/LLM MessageGenerator subclass.
     public func generate(messages: [Chat.Message]) -> [Message] {
-        messages.map { message in
+        let result = messages.map { message in
             var raw = generate(message: message)
             // Inject tool-related fields that model-specific generators don't handle
             if let toolCalls = message.toolCalls {
@@ -129,6 +129,9 @@ extension MessageGenerator {
             }
             return raw
         }
+        // wangqi modified 2026-03-10: Debug log to verify tool field injection before applyChatTemplate
+        print("[Chat.generate] \(result.count) msgs: \(result.map { (($0["role"] as? String) ?? "?") + ($0["tool_calls"] != nil ? "+TC" : "") + ($0["tool_call_id"] != nil ? "+TR" : "") }.joined(separator: " -> "))")
+        return result
     }
 
     public func generate(from input: UserInput) -> [Message] {

@@ -29,10 +29,14 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let data = jsonStr.data(using: .utf8),
+        if let data = jsonStr.data(using: .utf8),
             let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
-        else { return nil }
+        {
+            return ToolCall(function: function)
+        }
 
-        return ToolCall(function: function)
+        // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
+        // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
+        return XMLFunctionParser().parse(content: jsonStr, tools: tools)
     }
 }

@@ -27,6 +27,9 @@ public class ToolCallProcessor {
     // MARK: - Properties
 
     private let parser: any ToolCallParser
+    // Bridge app-level fallback parser (ToolCallParserChain); tried after primary parse fails
+    // wangqi modified 2026-03-10
+    private let fallbackParser: (any ToolCallParser)?
     private let tools: [[String: any Sendable]]?
     private var state = State.normal
     private var toolCallBuffer = ""
@@ -48,9 +51,13 @@ public class ToolCallProcessor {
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
+    ///   - fallbackParser: Optional fallback parser tried when primary parse returns nil
+    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil,
+                fallbackParser: (any ToolCallParser)? = nil) {
         self.parser = format.createParser()
         self.tools = tools
+        // wangqi modified 2026-03-10
+        self.fallbackParser = fallbackParser
     }
 
     // MARK: - Computed Properties
@@ -142,7 +149,9 @@ public class ToolCallProcessor {
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separator: endTag, returnLeading: false)
 
-                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                // wangqi modified 2026-03-10: try fallbackParser when primary parse returns nil
+                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools)
+                    ?? fallbackParser?.parse(content: toolCallBuffer, tools: tools) {
                     toolCalls.append(toolCall)
                 }
 
