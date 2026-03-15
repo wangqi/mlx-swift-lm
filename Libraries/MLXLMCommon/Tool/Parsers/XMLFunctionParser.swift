@@ -13,6 +13,13 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         self.endTag = endTag
     }
 
+    // no-tag init for use as a bare parser without outer wrapping tags
+    // wangqi modified 2026-03-15
+    public init() {
+        self.startTag = nil
+        self.endTag = nil
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Pattern: <function=(content)</function> — [\s\S] matches newlines
         guard

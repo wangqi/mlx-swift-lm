@@ -37,6 +37,6 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
         // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
-        return XMLFunctionParser().parse(content: jsonStr, tools: tools)
+        return XMLFunctionParser().parse(content: content, tools: tools)
     }
 }
