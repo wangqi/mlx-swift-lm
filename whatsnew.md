@@ -1,5 +1,48 @@
 # MLX Swift LM - What's New
 
+## tag-20260321 (2026-03-21)
+
+### Changes from tag-20260315 to tag-20260321
+
+**Fix: LFM2 Tool Calling with Nested Parentheses (#152)**
+`PythonicToolCallParser` was rewritten to handle nested parentheses in tool-call arguments (e.g. `func(arg="value(with parens)")`). The old `.*?` non-greedy regex failed when argument values contained parentheses, silently returning `nil` instead of a parsed tool call.
+
+New strategy:
+1. **Bracket pattern first**: `\[(\w+)\((.*?)\)\]` — the required closing `\]` forces the lazy `.*?` to backtrack past any inner `)`, correctly capturing the full argument string.
+2. **Index-based fallback**: For bracket-less format (e.g. `func(args...)`), uses `firstIndex(of: "(")` + `lastIndex(of: ")")` to find the outermost parentheses, avoiding the greedy/non-greedy pitfall entirely.
+
+**Fix: Quantized BERT / NomicBert Embedding Models Crash (SIGABRT) (#153)**
+Two distinct bugs fixed in `Bert.swift` and `NomicBert.swift`:
+
+1. **SIGABRT on load** — `BertModel.pooler` and `NomicBertModel.pooler` (both `Linear?`) were not annotated with `@ModuleInfo`. During quantization, `Module.update(modules:)` replaces them with `QuantizedLinear` via the non-throwing wrapper, which internally uses `try!`. Without `@ModuleInfo`, the module lookup throws `needModuleInfo`, causing `try!` to crash with SIGABRT.
+   - Fix: Added `@ModuleInfo` to both `pooler` properties.
+
+2. **Fatal error: mask dtype mismatch** — The attention mask was cast to `embedder.wordEmbeddings.weight.dtype` (always `float32` since `Embedding` layers are unquantized). When Q/K/V projections were quantized to `float16`, `MLXFast.scaledDotProductAttention` required the mask to match the output dtype (`float16`). A `float32` mask cannot promote down to `float16`, causing a fatal error.
+   - Fix: Cast the attention mask to `embeddings.dtype` (computed after the embedding forward pass), which reflects the actual compute dtype flowing into the encoder.
+
+**New: Gemma 3 Embedding Model (#136)**
+Full Gemma 3 embedding model implementation added to `MLXEmbedders`:
+- New file `Gemma3.swift` (~496 lines) with full encoder architecture
+- `l2Normalized()` helper added to `MLXArray`
+- Model aliases registered: `gemma3`, `gemma3_text`, `gemma3n`
+- `EmbeddingModel` properties made publicly readable
+- Integration tests added
+
+---
+
+### Risk Assessment
+
+| Change | Risk Level | Rationale |
+|--------|-----------|-----------|
+| LFM2 tool calling parser rewrite | Low | Bug fix only; other parsers (JSON, XML) untouched; LFM2-specific path; added tests cover the fixed cases |
+| BERT/NomicBert SIGABRT fix | Low | Pure bug fix; `@ModuleInfo` annotation is additive; dtype fix only affects quantized float16 models, which previously crashed on load |
+| Gemma 3 embedding model | Low | Additive only; new file behind factory registration; no changes to existing model paths |
+
+**Overall Upgrade Risk: Low**
+All three changes are targeted bug fixes or purely additive new model support. No breaking API changes. Quantized BERT/NomicBert embedding models that previously crashed will now load and run correctly — this is a material improvement for any user running those models on-device. Recommend smoke-testing LFM2 tool calling and any BERT-based embedding flows after upgrade.
+
+---
+
 ## tag-20260315 (2026-03-15)
 
 ### Changes from tag-20260309 to tag-20260315
