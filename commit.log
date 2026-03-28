@@ -1,992 +1,1664 @@
-commit 9ef85c73a65976c97cb8b1072e189fc2e5066827
-Merge: 08f0cf3 edd42fc
+commit dd1076b4228d5724ba422d819bccc3e8d0a293d2
+Merge: bbdfd15 eef4edc
+Author: wangqi <wang.qi@qikuyx.com>
+Date:   Sat Mar 28 10:52:12 2026 -0400
+
+    Merge remote-tracking branch 'refs/remotes/origin/main'
+
+commit eef4edc41dd0a6f94d8d56b286cce9cf541c246f
+Merge: 9ef85c7 2a296f1
 Author: Wang Qi <wangqi@users.noreply.github.com>
-Date:   Sat Mar 21 08:13:43 2026 -0400
+Date:   Sat Mar 28 10:51:23 2026 -0400
 
     Merge branch 'ml-explore:main' into main
 
-commit edd42fcd947eea0b19665248acf2975a28ddf58b
-Author: tpae <terencepae@gmail.com>
-Date:   Fri Mar 20 10:35:01 2026 -0700
+commit 2a296f145c3129fea4290bb6e4a0a5fb458efa06
+Author: alankessler <alankessler@gmail.com>
+Date:   Fri Mar 27 14:52:04 2026 -0700
 
-    Fix LFM2 tool calling with nested parentheses in arguments (#152)
+    Handle multiple tool calls in ChatSession (#162)
     
-    * added prefix matching for flexible parsing
+    The generation loop was breaking on the first tool call, canceling the
+    stream, and losing the rest. Now it drains the stream, collects all
+    tool calls, dispatches them, and restarts with all tool results.
     
-    * convert to pythonic tool converter
+    Skips dispatch if the consumer has canceled (Task.isCancelled).
+    No change to the streamDetails path.
     
-    * added qwen3_5 tool calling support
-    
-    * added detection at vlm level
-    
-    * updated per feedback, added nemotron
-    
-    * fixed lfm2 tool calling issues
+    Fixes #134.
 
-diff --git a/Libraries/MLXLMCommon/Load.swift b/Libraries/MLXLMCommon/Load.swift
-index 5a58beb..b587754 100644
---- a/Libraries/MLXLMCommon/Load.swift
-+++ b/Libraries/MLXLMCommon/Load.swift
-@@ -27,7 +27,7 @@ public func downloadModel(
-         case .id(let id, let revision):
-             // download the model weights
-             let repo = Hub.Repo(id: id)
--            let modelFiles = ["*.safetensors", "*.json"]
-+            let modelFiles = ["*.safetensors", "*.json", "*.jinja"]
-             return try await hub.snapshot(
-                 from: repo,
-                 revision: revision,
-diff --git a/Libraries/MLXLMCommon/Tool/Parsers/PythonicToolCallParser.swift b/Libraries/MLXLMCommon/Tool/Parsers/PythonicToolCallParser.swift
-index 73daec3..b0109e8 100644
---- a/Libraries/MLXLMCommon/Tool/Parsers/PythonicToolCallParser.swift
-+++ b/Libraries/MLXLMCommon/Tool/Parsers/PythonicToolCallParser.swift
-@@ -27,28 +27,37 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
+diff --git a/Libraries/MLXLMCommon/ChatSession.swift b/Libraries/MLXLMCommon/ChatSession.swift
+index 4f3ca78..147d979 100644
+--- a/Libraries/MLXLMCommon/ChatSession.swift
++++ b/Libraries/MLXLMCommon/ChatSession.swift
+@@ -419,18 +419,15 @@ public final class ChatSession {
+                             iterator: iterator
+                         )
  
-         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+-                        for await item in stream {
+-                            // if there is no toolDispatch then the caller must
+-                            // handle the toolcall
+-                            if let toolCall = item.toolCall, let toolDispatch {
+-                                let toolResult = try await toolDispatch(toolCall)
+-                                messages = [.tool(toolResult)]
+-                                task.cancel()
+-                                await task.value
+-                                continue restart
+-                            }
++                        var pendingToolCalls: [ToolCall] = []
  
--        // Pattern: [function_name(args...)] or function_name(args...)
--        // Also handle multiple calls: [func1(args), func2(args)]
--        let pattern = #"\[?(\w+)\((.*?)\)\]?"#
--
--        guard
--            let regex = try? NSRegularExpression(
--                pattern: pattern, options: [.dotMatchesLineSeparators]),
-+        let funcName: String
-+        let argsString: String
+-                            if let value = transform(item) {
++                        for await item in stream {
++                            // collect tool calls for dispatch; if no
++                            // toolDispatch the caller handles them via
++                            // the transform (streamDetails path)
++                            if let toolCall = item.toolCall, toolDispatch != nil {
++                                pendingToolCalls.append(toolCall)
++                            } else if let value = transform(item) {
+                                 if case .terminated = continuation.yield(value) {
+                                     break
+                                 }
+@@ -441,6 +438,17 @@ public final class ChatSession {
+                         // the case where we broke the loop early as the generation
+                         // work may continue (briefly) and use the KVCache
+                         await task.value
 +
-+        // Required brackets pattern (matches Python reference: r"\[(\w+)\((.*?)\)\]")
-+        // The required \] forces .*? to backtrack past nested ) inside argument values.
-+        let bracketPattern = #"\[(\w+)\((.*?)\)\]"#
-+        if let regex = try? NSRegularExpression(
-+            pattern: bracketPattern, options: [.dotMatchesLineSeparators]),
-             let match = regex.firstMatch(
--                in: text, options: [], range: NSRange(text.startIndex..., in: text))
--        else { return nil }
--
--        // Extract function name
--        guard let nameRange = Range(match.range(at: 1), in: text) else { return nil }
--        let funcName = String(text[nameRange])
--
--        // Extract arguments string
--        guard let argsRange = Range(match.range(at: 2), in: text) else { return nil }
--        let argsString = String(text[argsRange])
-+                in: text, options: [], range: NSRange(text.startIndex..., in: text)),
-+            let nameRange = Range(match.range(at: 1), in: text),
-+            let argsRange = Range(match.range(at: 2), in: text)
-+        {
-+            funcName = String(text[nameRange])
-+            argsString = String(text[argsRange])
-+        } else {
-+            // Fallback for without-brackets case: use string indices to find the
-+            // outermost parentheses, avoiding the greedy/non-greedy regex pitfall.
-+            guard let openParen = text.firstIndex(of: "("),
-+                let closeParen = text.lastIndex(of: ")")
-+            else { return nil }
++                        // dispatch all tool calls from this generation pass
++                        if let toolDispatch, !pendingToolCalls.isEmpty,
++                            !Task.isCancelled
++                        {
++                            for toolCall in pendingToolCalls {
++                                let toolResult = try await toolDispatch(toolCall)
++                                messages.append(.tool(toolResult))
++                            }
++                            continue restart
++                        }
+                     }
+ 
+                     continuation.finish()
+
+commit af777ae38ef99c6c855a937c1821a3678ca82dad
+Author: Xingyue <sxy@trans-n.ai>
+Date:   Sat Mar 28 06:49:35 2026 +0900
+
+    Add model-defined pooling fallback for embedding models (#156)
+    
+    * Add model-defined pooling fallback for embedding models
+    
+    * Use takeAlong for last-token pooling
+
+diff --git a/Libraries/MLXEmbedders/EmbeddingModel.swift b/Libraries/MLXEmbedders/EmbeddingModel.swift
+index d55b2c4..a869c24 100644
+--- a/Libraries/MLXEmbedders/EmbeddingModel.swift
++++ b/Libraries/MLXEmbedders/EmbeddingModel.swift
+@@ -56,7 +56,7 @@ public actor ModelContainer {
+ 
+         self.model = try loadSynchronous(
+             modelDirectory: modelDirectory, modelName: configuration.name)
+-        self.pooler = loadPooling(modelDirectory: modelDirectory)
++        self.pooler = loadPooling(modelDirectory: modelDirectory, model: model)
+ 
+         let (tokenizerConfig, tokenizerData) = try await tokenizerConfigTask
+         self.tokenizer = try PreTrainedTokenizer(
+@@ -100,6 +100,7 @@ public struct EmbeddingModelOutput {
+ 
+ public protocol EmbeddingModel: Module {
+     var vocabularySize: Int { get }
++    var poolingStrategy: Pooling.Strategy? { get }
+ 
+     func callAsFunction(
+         _ inputs: MLXArray,
+@@ -113,6 +114,10 @@ public protocol EmbeddingModel: Module {
+ }
+ 
+ extension EmbeddingModel {
++    public var poolingStrategy: Pooling.Strategy? {
++        nil
++    }
 +
-+            let name = text[text.startIndex ..< openParen]
-+            guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" })
-+            else { return nil }
+     func callAsFunction(
+         _ inputs: MLXArray,
+         positionIds: MLXArray? = nil,
+diff --git a/Libraries/MLXEmbedders/Models/Qwen3.swift b/Libraries/MLXEmbedders/Models/Qwen3.swift
+index 3317e29..6959e83 100644
+--- a/Libraries/MLXEmbedders/Models/Qwen3.swift
++++ b/Libraries/MLXEmbedders/Models/Qwen3.swift
+@@ -303,6 +303,9 @@ public class Qwen3Model: Module, EmbeddingModel {
+     /// The immutable configuration used to build the model.
+     let configuration: Qwen3Configuration
+ 
++    /// Qwen3 embedding models use the final non-padding token as the sentence representation.
++    public let poolingStrategy: Pooling.Strategy? = .last
 +
-+            funcName = String(name)
-+            argsString = String(text[text.index(after: openParen) ..< closeParen])
+     /// Initializes the Qwen3 Model.
+     /// - Parameter args: The configuration parameters for the model architecture.
+     public init(_ args: Qwen3Configuration) {
+diff --git a/Libraries/MLXEmbedders/Pooling.swift b/Libraries/MLXEmbedders/Pooling.swift
+index 64d3256..c1c9e1b 100644
+--- a/Libraries/MLXEmbedders/Pooling.swift
++++ b/Libraries/MLXEmbedders/Pooling.swift
+@@ -38,20 +38,25 @@ public struct PoolingConfiguration: Codable {
+ /// Loads a `Pooling` module from a specific model directory.
+ ///
+ /// It looks for a configuration file located at `1_Pooling/config.json` within the provided directory.
+-/// If the file is missing or invalid, it returns a `Pooling` module with strategy `.none`.
++/// If the file is missing or invalid, it falls back to the embedding model's built-in pooling strategy.
++/// If neither source provides a strategy, it returns a `Pooling` module with strategy `.none`.
+ ///
+ /// - Parameter modelDirectory: The base URL of the model weights and configuration.
++/// - Parameter model: The loaded embedding model.
+ /// - Returns: An initialized `Pooling` module.
+-func loadPooling(modelDirectory: URL) -> Pooling {
++func loadPooling(modelDirectory: URL, model: EmbeddingModel) -> Pooling {
+     let configurationURL = modelDirectory.appending(components: "1_Pooling", "config.json")
+-    guard
+-        let poolingConfig = try? JSONDecoder.json5().decode(
+-            PoolingConfiguration.self, from: Data(contentsOf: configurationURL))
+-    else {
+-        return Pooling(strategy: .none)
++    if let poolingConfig = try? JSONDecoder.json5().decode(
++        PoolingConfiguration.self, from: Data(contentsOf: configurationURL))
++    {
++        return Pooling(config: poolingConfig)
+     }
+ 
+-    return Pooling(config: poolingConfig)
++    if let strategy = model.poolingStrategy {
++        return Pooling(strategy: strategy)
++    }
++
++    return Pooling(strategy: .none)
+ }
+ 
+ /// A module that performs pooling operations on hidden states to produce fixed-sized sentence embeddings.
+@@ -146,7 +151,15 @@ public class Pooling: Module {
+         case .first:
+             pooled = inputs.hiddenStates![0..., 0, 0...]
+         case .last:
+-            pooled = inputs.hiddenStates![0..., -1, 0...]
++            let hiddenStates = inputs.hiddenStates!
++            let tokenCounts = sum(_mask.asType(.int32), axis: -1)
++            let tokenIndices = MLX.maximum(
++                tokenCounts - MLXArray(Int32(1)),
++                MLXArray(Int32(0))
++            )
++            let indices = tokenIndices.expandedDimensions(axes: [1, 2])
++            let gathered = MLX.takeAlong(hiddenStates, indices, axis: 1)
++            pooled = MLX.squeezed(gathered, axis: 1)
+         case .cls:
+             pooled =
+                 inputs.pooledOutput
+diff --git a/Tests/MLXLMTests/EmbeddingPoolingTests.swift b/Tests/MLXLMTests/EmbeddingPoolingTests.swift
+new file mode 100644
+index 0000000..329d045
+--- /dev/null
++++ b/Tests/MLXLMTests/EmbeddingPoolingTests.swift
+@@ -0,0 +1,64 @@
++import Foundation
++import MLX
++import Testing
++
++@testable import MLXEmbedders
++
++struct EmbeddingPoolingTests {
++
++    @Test("Last-token pooling uses the final non-padding token")
++    func testLastPoolingRespectsMask() {
++        let hiddenStates = MLXArray([
++            1.0 as Float, 2.0,
++            3.0, 4.0,
++            5.0, 6.0,
++            10.0, 20.0,
++            30.0, 40.0,
++            50.0, 60.0,
++        ]).reshaped(2, 3, 2)
++        let mask =
++            MLXArray([
++                1 as Int32, 1, 0,
++                1, 1, 1,
++            ]).reshaped(2, 3) .== MLXArray(Int32(1))
++
++        let pooled = Pooling(strategy: .last)(
++            EmbeddingModelOutput(hiddenStates: hiddenStates, pooledOutput: nil),
++            mask: mask
++        )
++        pooled.eval()
++
++        #expect(pooled.shape == [2, 2])
++        #expect(pooled[0].asArray(Float.self) == [3.0, 4.0])
++        #expect(pooled[1].asArray(Float.self) == [50.0, 60.0])
++    }
++
++    @Test("Qwen3 falls back to model-defined pooling when 1_Pooling metadata is missing")
++    func testQwen3FallbackPoolingStrategy() throws {
++        let config = try JSONDecoder().decode(
++            Qwen3Configuration.self,
++            from: Data(
++                """
++                {
++                  "hidden_size": 1024,
++                  "num_hidden_layers": 1,
++                  "intermediate_size": 1536,
++                  "num_attention_heads": 16,
++                  "rms_norm_eps": 0.000001,
++                  "vocab_size": 1024,
++                  "num_key_value_heads": 8,
++                  "head_dim": 64
++                }
++                """.utf8))
++        let model = Qwen3Model(config)
++        let modelDirectory = FileManager.default.temporaryDirectory
++            .appendingPathComponent(UUID().uuidString, isDirectory: true)
++        try FileManager.default.createDirectory(
++            at: modelDirectory, withIntermediateDirectories: true)
++
++        let pooling = loadPooling(modelDirectory: modelDirectory, model: model)
++
++        #expect(pooling.strategy == .last)
++        #expect(pooling.dimension == nil)
++    }
++}
+
+commit b0f31bd4460bc96a74bada2a2792ae45ae626688
+Author: alankessler <alankessler@gmail.com>
+Date:   Fri Mar 27 14:48:39 2026 -0700
+
+    Add KV cache initializers and cache access to ChatSession (#151)
+    
+    * Add KVCache initializers and cache access to ChatSession
+    
+    Adds two new initializers that accept a pre-built [KVCache], plus
+    currentCache() and saveCache(to:) methods, addressing the gap noted
+    in issue #123 where loadPromptCache() had no path back into ChatSession.
+    
+    Use case: prefix caching. Build a KVCache from a long shared context
+    (system prompt + document) once, save it to disk, and restore it across
+    multiple sessions to skip re-prefilling the same tokens each time.
+    
+    New API:
+    
+      // Initialize with a restored cache
+      ChatSession(_ model: ModelContainer, cache: [KVCache], ...)
+      ChatSession(_ model: ModelContext, cache: [KVCache], ...)
+    
+      // Read the live cache after generation
+      func currentCache() async -> [KVCache]?
+    
+      // Save the live cache to disk (.safetensors)
+      func saveCache(to url: URL) async throws
+    
+    The .kvcache branch in streamMap already handles an injected cache
+    correctly — it uses the array directly without re-initializing,
+    so no changes to generation logic are required.
+    
+    * Add tests for history session and clear() cache behavior
+    
+    * Add LocalizedError conformance to ChatSessionError and document saveCache lock behavior
+    
+    * Remove redundant thread-safety comment from saveCache
+    
+    * Make cache parameter consuming and improve cache init docs
+    
+    - Mark cache parameter as `consuming` to prevent reuse of shared
+      mutable KVCache references across sessions
+    - Reorder parameters so `instructions` comes before `cache`, matching
+      the history initializer pattern
+    - Warn that passing instructions when the cache already encodes a
+      system prompt will produce incoherent output
+    - Document that currentCache() references must not be used concurrently
+      with active generation
+    - Fix currentCache() to avoid mutable captured var (reduces Sendable
+      warnings)
+    - Fix ambiguous init reference in saveCache() doc comment
+
+diff --git a/Libraries/MLXLMCommon/ChatSession.swift b/Libraries/MLXLMCommon/ChatSession.swift
+index a123471..4f3ca78 100644
+--- a/Libraries/MLXLMCommon/ChatSession.swift
++++ b/Libraries/MLXLMCommon/ChatSession.swift
+@@ -158,6 +158,90 @@ public final class ChatSession {
+         self.additionalContext = additionalContext
+     }
+ 
++    /// Initialize the `ChatSession` with a pre-built KV cache.
++    ///
++    /// This enables prefix caching: build a KV cache from a long shared context (e.g. a
++    /// system prompt and document) once, save it via ``saveCache(to:)``, and restore it
++    /// across multiple sessions to avoid re-prefilling the same tokens each time.
++    ///
++    /// > Important: If the cache was built from a session that already included system
++    /// > instructions, do not pass the same `instructions` here — they would be
++    /// > re-tokenized on each call to ``respond(to:role:images:videos:)`` without matching
++    /// > KV state, producing incoherent output.
++    ///
++    /// - Parameters:
++    ///   - model: the ``ModelContainer``
++    ///   - instructions: optional system instructions for the session — leave `nil` if the
++    ///     cache already encodes a system prompt
++    ///   - cache: a non-empty ``[KVCache]`` previously obtained from ``saveCache(to:)`` or
++    ///     ``currentCache()``, matching the given model
++    ///   - generateParameters: parameters that control generation
++    ///   - processing: media processing configuration for images/videos
++    ///   - tools: optional tool specifications
++    ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
++    ///   - additionalContext: optional model-specific context
++    public init(
++        _ model: ModelContainer,
++        instructions: String? = nil,
++        cache: consuming [KVCache],
++        generateParameters: GenerateParameters = .init(),
++        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
++        additionalContext: [String: any Sendable]? = nil,
++        tools: [ToolSpec]? = nil,
++        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
++    ) {
++        self.model = model
++        self.instructions = instructions
++        self.cache = .init(.kvcache(cache))
++        self.processing = processing
++        self.generateParameters = generateParameters
++        self.tools = tools
++        self.toolDispatch = toolDispatch
++        self.additionalContext = additionalContext
++    }
++
++    /// Initialize the `ChatSession` with a pre-built KV cache.
++    ///
++    /// This enables prefix caching: build a KV cache from a long shared context (e.g. a
++    /// system prompt and document) once, save it via ``saveCache(to:)``, and restore it
++    /// across multiple sessions to avoid re-prefilling the same tokens each time.
++    ///
++    /// > Important: If the cache was built from a session that already included system
++    /// > instructions, do not pass the same `instructions` here — they would be
++    /// > re-tokenized on each call to ``respond(to:role:images:videos:)`` without matching
++    /// > KV state, producing incoherent output.
++    ///
++    /// - Parameters:
++    ///   - model: the ``ModelContext``
++    ///   - instructions: optional system instructions for the session — leave `nil` if the
++    ///     cache already encodes a system prompt
++    ///   - cache: a non-empty ``[KVCache]`` previously obtained from ``saveCache(to:)`` or
++    ///     ``currentCache()``, matching the given model
++    ///   - generateParameters: parameters that control generation
++    ///   - processing: media processing configuration for images/videos
++    ///   - tools: optional tool specifications
++    ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
++    ///   - additionalContext: optional model-specific context
++    public init(
++        _ model: ModelContext,
++        instructions: String? = nil,
++        cache: consuming [KVCache],
++        generateParameters: GenerateParameters = .init(),
++        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
++        additionalContext: [String: any Sendable]? = nil,
++        tools: [ToolSpec]? = nil,
++        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
++    ) {
++        self.model = ModelContainer(context: model)
++        self.instructions = instructions
++        self.cache = .init(.kvcache(cache))
++        self.processing = processing
++        self.generateParameters = generateParameters
++        self.tools = tools
++        self.toolDispatch = toolDispatch
++        self.additionalContext = additionalContext
++    }
++
+     /// Produces a response to a prompt.
+     ///
+     /// - Parameters:
+@@ -406,4 +490,47 @@ public final class ChatSession {
+     public func synchronize() async {
+         await cache.read { _ in }
+     }
++
++    /// Returns the current KV cache, if one has been built.
++    ///
++    /// Returns `nil` if no generation has occurred yet (cache is still empty) or if the
++    /// session is in history-rehydration mode and generation has not started.
++    ///
++    /// The returned array holds references to the live cache objects — do not use them
++    /// concurrently with an active ``respond(to:role:images:videos:)`` or
++    /// ``streamResponse(_:)`` call on the same session. To persist the cache
++    /// across process launches, use ``saveCache(to:)`` instead.
++    public func currentCache() async -> [KVCache]? {
++        await cache.read { cache in
++            if case .kvcache(let array) = cache {
++                return array
++            }
++            return nil
 +        }
- 
--        // Parse arguments
-         let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
--
-         return ToolCall(function: .init(name: funcName, arguments: arguments))
-     }
- 
-diff --git a/Tests/MLXLMTests/ToolTests.swift b/Tests/MLXLMTests/ToolTests.swift
-index 7b5c348..51cbc5a 100644
---- a/Tests/MLXLMTests/ToolTests.swift
-+++ b/Tests/MLXLMTests/ToolTests.swift
-@@ -155,6 +155,34 @@ struct ToolTests {
-         #expect(toolCall.function.arguments["timezone"] == .string("UTC"))
-     }
- 
-+    @Test("Test Pythonic Tool Call Parser - Nested Parentheses in Argument Value")
-+    func testPythonicParserNestedParentheses() throws {
-+        let parser = PythonicToolCallParser(
-+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
-+        let content =
-+            "<|tool_call_start|>[run_script(code=\"response = requests.get('https://api.example.com/data')\")] <|tool_call_end|>"
-+
-+        let toolCall = try #require(parser.parse(content: content, tools: nil))
-+
-+        #expect(toolCall.function.name == "run_script")
-+        #expect(
-+            toolCall.function.arguments["code"]
-+                == .string("response = requests.get('https://api.example.com/data')"))
 +    }
 +
-+    @Test("Test Pythonic Tool Call Parser - Nested Parentheses Without Brackets")
-+    func testPythonicParserNestedParenthesesNoBrackets() throws {
-+        let parser = PythonicToolCallParser(
-+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
-+        let content =
-+            "<|tool_call_start|>run_script(code=\"print('hello')\")<|tool_call_end|>"
++    /// Saves the current KV cache to disk.
++    ///
++    /// Use one of the initializers that accept a `cache` parameter together with
++    /// ``loadPromptCache(url:)`` to restore the saved cache in a future session.
++    ///
++    /// - Parameter url: the file URL to write the cache to
++    /// - Throws: ``ChatSessionError/noCacheAvailable`` if no generation has occurred yet,
++    ///   or any error thrown by the underlying file write
++    public func saveCache(to url: URL) async throws {
++        guard let kvCache = await currentCache() else {
++            throw ChatSessionError.noCacheAvailable
++        }
++        try savePromptCache(url: url, cache: kvCache)
++    }
++}
 +
-+        let toolCall = try #require(parser.parse(content: content, tools: nil))
++/// Errors thrown by ``ChatSession``.
++public enum ChatSessionError: LocalizedError {
++    /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
++    case noCacheAvailable
 +
-+        #expect(toolCall.function.name == "run_script")
-+        #expect(toolCall.function.arguments["code"] == .string("print('hello')"))
++    public var errorDescription: String? {
++        "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
++    }
+ }
+diff --git a/Tests/MLXLMTests/ChatSessionTests.swift b/Tests/MLXLMTests/ChatSessionTests.swift
+index 36947a5..6cf87b8 100644
+--- a/Tests/MLXLMTests/ChatSessionTests.swift
++++ b/Tests/MLXLMTests/ChatSessionTests.swift
+@@ -159,6 +159,94 @@ public class ChatSessionTests: XCTestCase {
+         XCTAssertGreaterThan(result.count, targetLength, result)
+     }
+ 
++    // MARK: - KV Cache
++
++    func testCurrentCacheNilBeforeGeneration() async throws {
++        let session = ChatSession(model())
++        let cache = await session.currentCache()
++        XCTAssertNil(cache)
 +    }
 +
-     @Test("Test Pythonic Tool Call Parser - No Arguments")
-     func testPythonicParserNoArguments() throws {
-         let parser = PythonicToolCallParser(
++    func testCurrentCacheAfterGeneration() async throws {
++        let session = ChatSession(model())
++        _ = try await session.respond(to: "hello")
++        let cache = await session.currentCache()
++        XCTAssertNotNil(cache)
++    }
++
++    func testInitWithKVCache() async throws {
++        // build a cache from an initial session
++        let ctx = model()
++        let initial = ChatSession(ctx)
++        _ = try await initial.respond(to: "hello")
++        guard let cache = await initial.currentCache() else {
++            XCTFail("expected cache after generation")
++            return
++        }
++
++        // restore the cache into a new session and verify generation continues
++        let restored = ChatSession(ctx, cache: cache)
++        let result = try await restored.respond(to: "hello again")
++        XCTAssertGreaterThan(result.count, targetLength, result)
++    }
++
++    func testSaveCacheThrowsBeforeGeneration() async throws {
++        let session = ChatSession(model())
++        let url = FileManager.default.temporaryDirectory
++            .appendingPathComponent(UUID().uuidString)
++            .appendingPathExtension("safetensors")
++        do {
++            try await session.saveCache(to: url)
++            XCTFail("expected ChatSessionError.noCacheAvailable")
++        } catch ChatSessionError.noCacheAvailable {
++            // expected
++        }
++    }
++
++    func testSaveAndRestoreCache() async throws {
++        let ctx = model()
++        let initial = ChatSession(ctx)
++        _ = try await initial.respond(to: "hello")
++
++        let url = FileManager.default.temporaryDirectory
++            .appendingPathComponent(UUID().uuidString)
++            .appendingPathExtension("safetensors")
++        try await initial.saveCache(to: url)
++
++        let (loadedCache, _) = try loadPromptCache(url: url)
++        let restored = ChatSession(ctx, cache: loadedCache)
++        let result = try await restored.respond(to: "hello again")
++        XCTAssertGreaterThan(result.count, targetLength, result)
++    }
++
++    func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {
++        // .history state should behave like .empty: no cache until first generation
++        let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
++        let session = ChatSession(model(), history: history)
++        let cache = await session.currentCache()
++        XCTAssertNil(cache)
++    }
++
++    func testCurrentCacheNonNilForHistorySessionAfterGeneration() async throws {
++        // after generation from .history state, cache transitions to .kvcache
++        let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
++        let session = ChatSession(model(), history: history)
++        _ = try await session.respond(to: "hello again")
++        let cache = await session.currentCache()
++        XCTAssertNotNil(cache)
++    }
++
++    func testCurrentCacheNilAfterClear() async throws {
++        // clear() resets to .empty; currentCache() should return nil again
++        let session = ChatSession(model())
++        _ = try await session.respond(to: "hello")
++        let cacheBeforeClear = await session.currentCache()
++        XCTAssertNotNil(cacheBeforeClear)
++        await session.clear()
++        let cacheAfterClear = await session.currentCache()
++        XCTAssertNil(cacheAfterClear)
++    }
++
+     /// something that looks like a view model
+     @MainActor class ChatModel {
+         let session: ChatSession
 
-commit 3a7503df30e2cd100be933322dcf9b25d6459803
-Author: Bahram Shamshiri <jowharshamshiri@gmail.com>
-Date:   Fri Mar 20 00:09:39 2026 +0100
+commit 807885c1cef9b89f84a463f789c69f3768ea0e22
+Author: alankessler <alankessler@gmail.com>
+Date:   Fri Mar 27 14:47:06 2026 -0700
 
-    fix: @ModuleInfo for pooler + attention mask dtype in Bert/NomicBert (#153)
+    Add copy() to KVCache protocol and all implementations (#158)
     
-    * fix: add @ModuleInfo to BertModel.pooler and NomicBertModel.pooler
+    * Add copy() to KVCache protocol and all implementations
     
-    These Linear? properties are replaced by QuantizedLinear during
-    quantization via Module.update(modules:). Without @ModuleInfo,
-    the non-throwing update(modules:) wrapper hits try! on the thrown
-    needModuleInfo error, causing SIGABRT when loading quantized
-    embedding models.
+    Add an independent deep-copy method to enable reusing a prefix cache
+    across multiple ChatSession instances without reloading from disk.
     
-    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+    - Add copy() requirement to KVCache protocol
+    - Implement on KVCacheSimple, RotatingKVCache, QuantizedKVCache,
+      ChunkedKVCache, ArraysCache, MambaCache, and CacheList
+    - Guard against empty state in all copy() methods to avoid fatalError
+      from state setters that reject empty arrays
+    - Preserve leftPadding in ArraysCache/MambaCache copies
+    - Add CacheList array-based initializer to support copy()
+    - Change ArraysCache.leftPadding from private to internal for
+      subclass access in MambaCache.copy()
     
-    * fix: cast attention mask to embeddings output dtype in Bert and NomicBert
+    Tests:
+    - testCacheCopyIsIndependent: parameterized across 6 cache types,
+      verifies copy has same state and mutation of copy leaves original
+      unchanged
+    - testCacheCopyOnEmptyCache: verifies copy of unpopulated cache
+      does not crash
+    - testCacheListCopyIsIndependent: verifies CacheList with
+      heterogeneous sub-caches copies independently
     
-    The attention mask was cast to `embedder.wordEmbeddings.weight.dtype`,
-    which can be float32 since Embedding layers are not quantized. When
-    Linear layers (Q/K/V projections) are quantized to float16,
-    `MLXFast.scaledDotProductAttention` requires the mask to promote to the
-    output type (float16). A float32 mask cannot promote *down* to float16,
-    causing a fatal error:
+    * Bump mlx-swift dependency to 0.31.1
     
-      [scaled_dot_product_attention] Mask type must promote to output type
-      float16.
+    Picks up the fix for array[.ellipsis] returning self instead of a
+    copy (ml-explore/mlx-swift#367), plus mlx 0.31.1 C++ updates.
+
+diff --git a/Libraries/MLXLMCommon/KVCache.swift b/Libraries/MLXLMCommon/KVCache.swift
+index 6f5efbd..9484b96 100644
+--- a/Libraries/MLXLMCommon/KVCache.swift
++++ b/Libraries/MLXLMCommon/KVCache.swift
+@@ -71,6 +71,9 @@ public protocol KVCache: Evaluatable {
+     func makeMask(
+         n: Int, windowSize: Int?, returnArray: Bool
+     ) -> MLXFast.ScaledDotProductAttentionMaskMode
++
++    /// Create an independent deep copy of this cache.
++    func copy() -> any KVCache
+ }
+ 
+ /// Protocol for caches that support efficient quantized operations
+@@ -149,6 +152,10 @@ open class BaseKVCache: KVCache {
+     @discardableResult
+     open func trim(_ n: Int) -> Int { 0 }
+ 
++    open func copy() -> any KVCache {
++        fatalError("copy() must be implemented by subclass")
++    }
++
+     /// Default implementation for caches without special mask requirements
+     open func makeMask(
+         n: Int, windowSize: Int?, returnArray: Bool
+@@ -419,6 +426,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+         return quantizedCache
+     }
+ 
++    public override func copy() -> any KVCache {
++        let new = KVCacheSimple()
++        new.step = self.step
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        return new
++    }
++
+     public var debugDescription: String {
+         "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
+     }
+@@ -680,6 +697,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
+         "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
+     }
+ 
++    public override func copy() -> any KVCache {
++        let new = RotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        new.metaState = self.metaState
++        return new
++    }
++
+     /// Convert to quantized cache
+     /// Note: This is complex due to the rotating nature and temporal ordering
+     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+@@ -925,6 +952,16 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
+         return trimmed
+     }
+ 
++    public override func copy() -> any KVCache {
++        let new = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        new.metaState = self.metaState
++        return new
++    }
++
+     /// Convert to unquantized cache
+     public func toUnquantized() -> KVCacheSimple {
+         let simpleCache = KVCacheSimple()
+@@ -1014,6 +1051,17 @@ public class ChunkedKVCache: KVCacheSimple {
+         return trimmed
+     }
+ 
++    public override func copy() -> any KVCache {
++        let new = ChunkedKVCache(chunkSize: chunkSize)
++        new.step = self.step
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        new.metaState = self.metaState
++        return new
++    }
++
+     public override var metaState: [String] {
+         get {
+             let chunkSizeStr = chunkSize?.description ?? "None"
+@@ -1036,7 +1084,7 @@ public class ChunkedKVCache: KVCacheSimple {
+ /// Base cache for array-based state storage
+ public class ArraysCache: BaseKVCache {
+     private var cache: [MLXArray?]
+-    private var leftPadding: MLXArray?
++    internal var leftPadding: MLXArray?
+ 
+     public init(size: Int, leftPadding: [Int]? = nil) {
+         self.cache = Array(repeating: nil, count: size)
+@@ -1062,6 +1110,17 @@ public class ArraysCache: BaseKVCache {
+         }
+     }
+ 
++    public override func copy() -> any KVCache {
++        let new = ArraysCache(size: cache.count)
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        new.offset = self.offset
++        new.leftPadding = self.leftPadding
++        return new
++    }
++
+     /// In-place filter to keep just the given indices in the cache
+     public func filter(batchIndices: MLXArray) {
+         cache = cache.map { c in
+@@ -1096,6 +1155,17 @@ public class MambaCache: ArraysCache {
+     public init(leftPadding: [Int]? = nil) {
+         super.init(size: 2, leftPadding: leftPadding)
+     }
++
++    public override func copy() -> any KVCache {
++        let new = MambaCache()
++        let s = self.state
++        if !s.isEmpty {
++            new.state = s.map { $0[.ellipsis] }
++        }
++        new.offset = self.offset
++        new.leftPadding = self.leftPadding
++        return new
++    }
+ }
+ 
+ /// Composite cache that manages multiple sub-caches
+@@ -1107,6 +1177,11 @@ public class CacheList: BaseKVCache {
+         super.init()
+     }
+ 
++    public init(_ caches: [any KVCache]) {
++        self.caches = caches
++        super.init()
++    }
++
+     public override func innerState() -> [MLXArray] {
+         caches.flatMap { $0.innerState() }
+     }
+@@ -1132,6 +1207,12 @@ public class CacheList: BaseKVCache {
+         }
+     }
+ 
++    public override func copy() -> any KVCache {
++        let copiedCaches = caches.map { $0.copy() }
++        let new = CacheList(copiedCaches)
++        return new
++    }
++
+     public override var isTrimmable: Bool {
+         caches.allSatisfy { $0.isTrimmable }
+     }
+diff --git a/Package.swift b/Package.swift
+index 58791cc..9c5154c 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -26,7 +26,7 @@ let package = Package(
+             targets: ["MLXEmbedders"]),
+     ],
+     dependencies: [
+-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
++        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.1")),
+         .package(
+             url: "https://github.com/huggingface/swift-transformers",
+             .upToNextMinor(from: "1.2.0")
+diff --git a/Tests/MLXLMTests/KVCacheTests.swift b/Tests/MLXLMTests/KVCacheTests.swift
+index 28c4b91..fe342bb 100644
+--- a/Tests/MLXLMTests/KVCacheTests.swift
++++ b/Tests/MLXLMTests/KVCacheTests.swift
+@@ -3,16 +3,18 @@ import MLX
+ import MLXLMCommon
+ import Testing
+ 
++private let cacheCreators: [() -> any KVCache] = [
++    { KVCacheSimple() },
++    { RotatingKVCache(maxSize: 32) },
++    { QuantizedKVCache() },
++    { ChunkedKVCache(chunkSize: 16) },
++    { ArraysCache(size: 2) },
++    { MambaCache() },
++]
++
+ @Test(
+     .serialized,
+-    arguments: [
+-        ({ KVCacheSimple() }),
+-        ({ RotatingKVCache(maxSize: 32) }),
+-        ({ QuantizedKVCache() }),
+-        ({ ChunkedKVCache(chunkSize: 16) }),
+-        ({ ArraysCache(size: 2) }),
+-        ({ MambaCache() }),
+-    ])
++    arguments: cacheCreators)
+ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
+     let cache = (0 ..< 10).map { _ in creator() }
+     let keys = MLXArray.ones([1, 8, 32, 64], dtype: .bfloat16)
+@@ -43,3 +45,136 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
+         #expect(lhs.state.count == rhs.state.count)
+     }
+ }
++
++/// Verify that copy() produces an independent cache: same type, same state,
++/// but mutating the copy does not affect the original.
++@Test(
++    .serialized,
++    arguments: cacheCreators)
++func testCacheCopyIsIndependent(creator: (() -> any KVCache)) async throws {
++    let original = creator()
++
++    let keys = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
++    let values = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
++
++    // populate the original
++    switch original {
++    case let arrays as ArraysCache:
++        arrays[0] = keys
++        arrays[1] = values
++    case let quantized as QuantizedKVCache:
++        _ = quantized.updateQuantized(keys: keys, values: values)
++    default:
++        _ = original.update(keys: keys, values: values)
++    }
++
++    let originalOffset = original.offset
++    let originalState = original.state
++    eval(originalState)
++    let originalMeta = original.metaState
++
++    // copy
++    let copied = original.copy()
++
++    // same type
++    #expect(type(of: original) == type(of: copied))
++
++    // same offset and metadata
++    #expect(copied.offset == originalOffset)
++    #expect(copied.metaState == originalMeta)
++
++    // same state values
++    let copiedState = copied.state
++    eval(copiedState)
++    #expect(copiedState.count == originalState.count)
++    for (origArr, copyArr) in zip(originalState, copiedState) {
++        #expect(origArr.shape == copyArr.shape)
++        #expect(allClose(origArr, copyArr).item(Bool.self))
++    }
++
++    // mutate the copy — push more tokens through it
++    let moreKeys = MLXArray.zeros([1, 8, 2, 64], dtype: .bfloat16)
++    let moreValues = MLXArray.zeros([1, 8, 2, 64], dtype: .bfloat16)
++
++    switch copied {
++    case let arrays as ArraysCache:
++        // overwrite slot 0 with a different array
++        arrays[0] = moreKeys
++    case let quantized as QuantizedKVCache:
++        _ = quantized.updateQuantized(keys: moreKeys, values: moreValues)
++    default:
++        _ = copied.update(keys: moreKeys, values: moreValues)
++    }
++
++    // original must be unchanged
++    #expect(original.offset == originalOffset)
++    #expect(original.metaState == originalMeta)
++    let currentState = original.state
++    eval(currentState)
++    #expect(currentState.count == originalState.count)
++    for (origArr, savedArr) in zip(currentState, originalState) {
++        #expect(origArr.shape == savedArr.shape)
++        #expect(allClose(origArr, savedArr).item(Bool.self))
++    }
++}
++
++/// copy() on an empty (unpopulated) cache must not crash.
++@Test(
++    .serialized,
++    arguments: cacheCreators)
++func testCacheCopyOnEmptyCache(creator: (() -> any KVCache)) async throws {
++    let empty = creator()
++    let copied = empty.copy()
++
++    #expect(type(of: empty) == type(of: copied))
++    #expect(copied.offset == 0)
++    #expect(copied.state.count == empty.state.count)
++}
++
++/// CacheList.copy() produces independent sub-caches.
++@Test
++func testCacheListCopyIsIndependent() async throws {
++    let sub1 = KVCacheSimple()
++    let sub2 = RotatingKVCache(maxSize: 32)
++    let composite = CacheList(sub1, sub2)
++
++    let keys = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
++    let values = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
++    _ = sub1.update(keys: keys, values: values)
++    _ = sub2.update(keys: keys, values: values)
++
++    // snapshot original state — eval to materialize before copy
++    let originalState = composite.state
++    eval(originalState)
++    let originalOffset0 = sub1.offset
++    let originalOffset1 = sub2.offset
++
++    let copied = composite.copy()
++
++    #expect(copied is CacheList)
++    let copiedState = copied.state
++    eval(copiedState)
++    #expect(copiedState.count == originalState.count)
++    for (orig, copy) in zip(originalState, copiedState) {
++        #expect(orig.shape == copy.shape)
++        #expect(allClose(orig, copy).item(Bool.self))
++    }
++
++    // mutate inside the copy
++    let copiedList = copied as! CacheList
++    _ = copiedList[0].update(
++        keys: MLXArray.zeros([1, 8, 2, 64], dtype: .bfloat16),
++        values: MLXArray.zeros([1, 8, 2, 64], dtype: .bfloat16)
++    )
++
++    // originals unchanged
++    #expect(sub1.offset == originalOffset0)
++    #expect(sub2.offset == originalOffset1)
++    let currentState = composite.state
++    eval(currentState)
++    #expect(currentState.count == originalState.count)
++    for (orig, saved) in zip(currentState, originalState) {
++        #expect(orig.shape == saved.shape)
++        #expect(allClose(orig, saved).item(Bool.self))
++    }
++}
+
+commit f7a235db926e57928cbde47c9c27fdf4e054c770
+Author: spokvulcan <ivanchenko.b@gmail.com>
+Date:   Fri Mar 27 23:12:07 2026 +0200
+
+    perf: eliminate CPU←GPU sync in penalty processors, optimize TopPSampler (#147)
     
-    Fix: compute embeddings first, then cast the mask to `embeddings.dtype`,
-    which reflects the actual compute dtype flowing into the encoder and is
-    consistent with the attention output type.
+    * perf: eliminate CPU←GPU sync in penalty processors for 35% faster generation
     
-    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+    All three penalty processors (RepetitionContext, PresencePenaltyContext,
+    FrequencyPenaltyContext) called `token.item(Int.self)` in `didSample()`,
+    forcing a CPU←GPU synchronization on every generated token. This broke
+    the `asyncEval()` pipelining in `TokenIterator`, preventing the GPU from
+    working ahead on the next token while the current one was being returned.
+    
+    Fix: Replace Swift `[Int]` token buffers with GPU-resident ring buffers
+    (`MLXArray`). Update positions via `MLX.where` mask operations that stay
+    entirely on GPU. No `.item()` or `.asArray()` calls remain in the
+    hot path.
+    
+    Benchmarked on Qwen3.5-4B (248K vocab, topK=20, presencePenalty=1.5):
+    - Peak tok/s: 70 → 95 (+35%)
+    - Aggregate tok/s across 14 scenarios: 34.6 → 57.2 (+65%)
+    
+    The improvement comes from restoring async GPU pipelining — the GPU can
+    now compute the next token's forward pass while the current token is
+    being returned to the caller.
+    
+    * perf: optimize TopPSampler with argPartition for topK sampling
+    
+    When topK is set (e.g., 20) and much smaller than vocabulary size
+    (e.g., 248K), use argPartition O(V) to find top-K candidates instead
+    of argSort O(V log V) on the entire vocabulary. Then sort only the K
+    candidates O(K log K) for cumulative probability filtering.
+    
+    Also switch from take() to takeAlong() throughout to preserve
+    input dimensions and avoid squeeze/unsqueeze shape issues.
+    
+    * style: fix swift-format formatting in penalty processors
+    * refactor: address PR review — align sampling with Python mlx-lm
+    
+    - Remove Sendable from LogitProcessor (MLXArray is not Sendable)
+    - Extract TokenRing struct to deduplicate ring buffer across penalty processors
+    - Use MLXArray.arange() (GPU primitive) computed once in init
+    - Replace softmax with logSoftmax, work in log-prob space throughout
+    - Apply filters in Python mlx-lm order: top_p → min_p → top_k
+    - Each filter operates on full vocabulary matching mlx_lm.sample_utils
+    - Use putAlong for O(V) scatter instead of double argSort in applyTopP
+    
+    * Mirror mlx-lm top-k masking semantics
     
     ---------
     
-    Co-authored-by: Claude Opus 4.6 <noreply@anthropic.com>
+    Co-authored-by: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
-diff --git a/Libraries/MLXEmbedders/Models/Bert.swift b/Libraries/MLXEmbedders/Models/Bert.swift
-index 698d16d..2af0c75 100644
---- a/Libraries/MLXEmbedders/Models/Bert.swift
-+++ b/Libraries/MLXEmbedders/Models/Bert.swift
-@@ -253,7 +253,7 @@ public class BertModel: Module, EmbeddingModel {
-     @ModuleInfo(key: "embeddings") fileprivate var embedder: BertEmbedding
+diff --git a/Libraries/MLXLMCommon/Evaluate.swift b/Libraries/MLXLMCommon/Evaluate.swift
+index 418fb42..226f52e 100644
+--- a/Libraries/MLXLMCommon/Evaluate.swift
++++ b/Libraries/MLXLMCommon/Evaluate.swift
+@@ -2,6 +2,7 @@
  
-     /// A linear layer used to "pool" the [CLS] token into a single sentence vector.
--    let pooler: Linear?
-+    @ModuleInfo var pooler: Linear?
- 
-     /// The stack of Transformer layers.
-     fileprivate let encoder: Encoder
-@@ -274,10 +274,10 @@ public class BertModel: Module, EmbeddingModel {
- 
-         if lmHead {
-             _lmHead.wrappedValue = LMHead(config)
--            self.pooler = nil
-+            _pooler.wrappedValue = nil
-         } else {
-             // Pooler projects the [CLS] token to a hidden state of the same size
--            pooler = Linear(config.embedDim, config.embedDim)
-+            _pooler.wrappedValue = Linear(config.embedDim, config.embedDim)
-             _lmHead.wrappedValue = nil
-         }
-     }
-@@ -300,15 +300,19 @@ public class BertModel: Module, EmbeddingModel {
-         if inp.ndim == 1 {
-             inp = inp.reshaped(1, -1)
-         }
-+        let embeddings = embedder(inp, positionIds: positionIds, tokenTypeIds: tokenTypeIds)
-         var mask = attentionMask
-         if mask != nil {
--            mask = mask!.asType(embedder.wordEmbeddings.weight.dtype).expandedDimensions(axes: [
-+            // Cast mask to the same dtype as the embeddings output so it is
-+            // compatible with scaled_dot_product_attention's type promotion
-+            // rules. Using the embedding weight dtype can produce a mismatch
-+            // when Linear layers are quantized to float16 but Embedding
-+            // weights remain float32.
-+            mask = mask!.asType(embeddings.dtype).expandedDimensions(axes: [
-                 1, 2,
-             ]).log()
-         }
--        let outputs = encoder(
--            embedder(inp, positionIds: positionIds, tokenTypeIds: tokenTypeIds),
--            attentionMask: mask)
-+        let outputs = encoder(embeddings, attentionMask: mask)
-         if let lmHead {
-             return EmbeddingModelOutput(hiddenStates: lmHead(outputs), pooledOutput: nil)
-         } else {
-diff --git a/Libraries/MLXEmbedders/Models/NomicBert.swift b/Libraries/MLXEmbedders/Models/NomicBert.swift
-index 142a20f..417145b 100644
---- a/Libraries/MLXEmbedders/Models/NomicBert.swift
-+++ b/Libraries/MLXEmbedders/Models/NomicBert.swift
-@@ -671,7 +671,7 @@ public class NomicBertModel: Module, EmbeddingModel {
- 
-     /// The optional pooler layer.
-     /// Used to extract a single vector representation for the whole sequence (usually from the [CLS] token).
--    let pooler: Linear?
-+    @ModuleInfo var pooler: Linear?
- 
-     /// The stack of Transformer blocks.
-     fileprivate let encoder: Encoder
-@@ -696,9 +696,9 @@ public class NomicBertModel: Module, EmbeddingModel {
- 
-         // Initialize Pooler (for sentence embeddings)
-         if pooler {
--            self.pooler = Linear(config.embedDim, config.embedDim, bias: false)
-+            _pooler.wrappedValue = Linear(config.embedDim, config.embedDim, bias: false)
-         } else {
--            self.pooler = nil
-+            _pooler.wrappedValue = nil
-         }
- 
-         // Initialize LM Head (for training/masked prediction)
-@@ -739,18 +739,22 @@ public class NomicBertModel: Module, EmbeddingModel {
-         // Operation: .log().
-         //   log(1) = 0    (Add 0 to attention score -> No change)
-         //   log(0) = -inf (Add -inf to attention score -> Zero probability after Softmax)
-+        let embeddings = embedder(
-+            inp, positionIds: positionIds, tokenTypeIds: tokenTypeIds)
-         var mask = attentionMask
-         if mask != nil {
--            mask = mask!.asType(embedder.wordEmbeddings.weight.dtype).expandedDimensions(axes: [
-+            // Cast mask to the same dtype as the embeddings output so it is
-+            // compatible with scaled_dot_product_attention's type promotion
-+            // rules. Using the embedding weight dtype can produce a mismatch
-+            // when Linear layers are quantized to float16 but Embedding
-+            // weights remain float32.
-+            mask = mask!.asType(embeddings.dtype).expandedDimensions(axes: [
-                 1, 2,
-             ]).log()
-         }
- 
-         // 3. Encoder Pass
--        let outputs = encoder(
--            embedder(
--                inp, positionIds: positionIds, tokenTypeIds: tokenTypeIds),
--            attentionMask: mask)
-+        let outputs = encoder(embeddings, attentionMask: mask)
- 
-         // 4a. Return LM Head Output (if active)
-         if let lmHead {
-
-commit 642a448a88115f8b60491ca5910a27c795b28ccd
-Author: Christoph Rohde <44606665+CodebyCR@users.noreply.github.com>
-Date:   Thu Mar 19 23:17:17 2026 +0100
-
-    Add gemma 3 embedding model (#136)
-    
-    * Add Gemma 3 Embedding Model
-    * Make EmbeddingModel properties publicly readable
-    * Add Gemma 3 aliases, allow gemma3, gemma3_text and gemma3n
-    * add l2Normalized method
-
-diff --git a/ACKNOWLEDGMENTS.md b/ACKNOWLEDGMENTS.md
-index ad8ea19..c840b77 100644
---- a/ACKNOWLEDGMENTS.md
-+++ b/ACKNOWLEDGMENTS.md
-@@ -8,7 +8,7 @@ MLX Swift was developed with contributions from the following individuals:
- 
- - [John Mai](https://github.com/johnmai-dev): Added support for multiple models (Qwen2, Starcoder2, InternLM2, Qwen3,
-   Qwen3 MoE, GLM-4, MiMo, BitNet, SmolLM3, LFM2, Baichuan-M1, GPT-OSS, FalconH1, Exaone4, Qwen3.5, Qwen3.5 MoE).
--- [Christoph Rohde](https://github.com/CodebyCR): Improved Embedders documentation.
-+- [Christoph Rohde](https://github.com/CodebyCR): Improved Embedders documentation. Added Gemma 3 Embedding Model.
- 
- <a href="https://github.com/ml-explore/mlx-swift-lm/graphs/contributors">
-   <img class="dark-light" src="https://contrib.rocks/image?repo=ml-explore/mlx-swift-lm&anon=0&columns=20&max=100&r=true" />
-diff --git a/Libraries/MLXEmbedders/Configuration.swift b/Libraries/MLXEmbedders/Configuration.swift
-index 3336bc1..8da6aad 100644
---- a/Libraries/MLXEmbedders/Configuration.swift
-+++ b/Libraries/MLXEmbedders/Configuration.swift
-@@ -36,6 +36,18 @@ private class ModelTypeRegistry: @unchecked Sendable {
-             let configuration = try JSONDecoder.json5().decode(Qwen3Configuration.self, from: data)
-             return Qwen3Model(configuration)
-         },
-+        "gemma3": { data in
-+            let configuration = try JSONDecoder.json5().decode(Gemma3Configuration.self, from: data)
-+            return EmbeddingGemma(configuration)
-+        },
-+        "gemma3_text": { data in
-+            let configuration = try JSONDecoder.json5().decode(Gemma3Configuration.self, from: data)
-+            return EmbeddingGemma(configuration)
-+        },
-+        "gemma3n": { data in
-+            let configuration = try JSONDecoder.json5().decode(Gemma3Configuration.self, from: data)
-+            return EmbeddingGemma(configuration)
-+        },
-     ]
- 
-     public func registerModelType(
-diff --git a/Libraries/MLXEmbedders/EmbeddingModel.swift b/Libraries/MLXEmbedders/EmbeddingModel.swift
-index 3c7037b..d55b2c4 100644
---- a/Libraries/MLXEmbedders/EmbeddingModel.swift
-+++ b/Libraries/MLXEmbedders/EmbeddingModel.swift
-@@ -94,8 +94,8 @@ extension Module {
- }
- 
- public struct EmbeddingModelOutput {
--    let hiddenStates: MLXArray?
--    let pooledOutput: MLXArray?
-+    public let hiddenStates: MLXArray?
-+    public let pooledOutput: MLXArray?
- }
- 
- public protocol EmbeddingModel: Module {
-diff --git a/Libraries/MLXEmbedders/Extensions/MLXArray+Helper.swift b/Libraries/MLXEmbedders/Extensions/MLXArray+Helper.swift
-new file mode 100644
-index 0000000..9f75fa9
---- /dev/null
-+++ b/Libraries/MLXEmbedders/Extensions/MLXArray+Helper.swift
-@@ -0,0 +1,28 @@
-+// Copyright © 2026 Apple Inc.
-+
-+import MLX
-+
-+extension MLXArray {
-+
-+    /// Returns a new array normalized by its L2 norm along the specified axis.
-+    ///
-+    /// This operation scales the vectors along `axis` to unit length. If the
-+    /// norm is smaller than `eps`, it is clamped to `eps` to ensure numerical
-+    /// stability and prevent division by zero.
-+    ///
-+    /// - Parameters:
-+    ///   - axis: The axis along which to compute the norm. Defaults to `-1`.
-+    ///   - eps: A small epsilon value to prevent division by zero. Defaults to `1e-12`.
-+    /// - Returns: An `MLXArray` with the same shape as the original, normalized along `axis`.
-+    ///
-+    /// - Complexity: O(n), where n is the total number of elements in the array.
-+    public func l2Normalized(axis: Int = -1, eps: Float = 1e-12) -> MLXArray {
-+        // 'self' represents the current MLXArray instance.
-+        // We compute the norm along the specified axis.
-+        let norm = MLXLinalg.norm(self, ord: 2, axis: axis, keepDims: true)
-+
-+        // We use MLX.maximum to clamp the divisor.
-+        // This is more stable than adding eps to the norm.
-+        return self / MLX.maximum(norm, MLXArray(eps))
-+    }
-+}
-diff --git a/Libraries/MLXEmbedders/Models/Bert.swift b/Libraries/MLXEmbedders/Models/Bert.swift
-index 3f88365..698d16d 100644
---- a/Libraries/MLXEmbedders/Models/Bert.swift
-+++ b/Libraries/MLXEmbedders/Models/Bert.swift
-@@ -3,12 +3,6 @@
- import MLX
- import MLXNN
- 
--extension MLXArray {
--    public static func arange(_ size: Int) -> MLXArray {
--        return MLXArray(Array(0 ..< size))
--    }
--}
--
- // MARK: - Bert Embedding
- 
- /// The embedding layer for BERT models, combining token, position, and segment information.
-diff --git a/Libraries/MLXEmbedders/Models/Gemma3.swift b/Libraries/MLXEmbedders/Models/Gemma3.swift
-new file mode 100644
-index 0000000..a30ccbf
---- /dev/null
-+++ b/Libraries/MLXEmbedders/Models/Gemma3.swift
-@@ -0,0 +1,496 @@
-+// Copyright © 2026 Apple Inc.
-+
-+import Foundation
-+import MLX
-+import MLXLMCommon
-+import MLXNN
-+
-+// Based on https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma3_text.py
-+
-+// MARK: - Gemma3Configuration
-+
-+/// Configuration for the Gemma 3 model.
-+///
-+/// This structure holds all the hyperparameters required to initialize a `Gemma3ModelBackbone` or an `EmbeddingGemma` model.
-+/// It supports decoding from standard `config.json` files, including those nested under a `text_config` key.
-+public struct Gemma3Configuration: Codable, Sendable {
-+    /// The architecture identifier (e.g., "gemma3").
-+    public let modelType: String
-+
-+    /// The size of the hidden embeddings.
-+    public let hiddenSize: Int
-+
-+    /// The number of hidden layers in the transformer.
-+    public let hiddenLayers: Int
-+
-+    /// The dimensionality of the intermediate (feed-forward) layer.
-+    public let intermediateSize: Int
-+
-+    /// The number of attention heads.
-+    public let attentionHeads: Int
-+
-+    /// The dimensionality of each attention head.
-+    public let headDim: Int
-+
-+    /// The epsilon value for RMSNorm layers.
-+    public let rmsNormEps: Float
-+
-+    /// The size of the vocabulary.
-+    public let vocabularySize: Int
-+
-+    /// The number of key-value heads for Grouped Query Attention.
-+    public let kvHeads: Int
-+
-+    /// The base frequency for Rotary Positional Embeddings (RoPE) in global layers.
-+    public let ropeTheta: Float
-+
-+    /// The base frequency for RoPE in sliding window layers.
-+    public let ropeLocalBaseFreq: Float
-+
-+    /// Whether to use traditional RoPE (interleaved) or standard ordering.
-+    public let ropeTraditional: Bool
-+
-+    /// The scalar value used to scale queries before attention.
-+    public let queryPreAttnScalar: Float
-+
-+    /// The size of the sliding window for attention.
-+    public let slidingWindow: Int
-+
-+    /// The pattern determining which layers use sliding window vs. global attention.
-+    public let slidingWindowPattern: Int
-+
-+    /// The maximum sequence length supported by the model.
-+    public let maxPositionEmbeddings: Int
-+
-+    /// Optional scaling configuration for RoPE.
-+    public let ropeScaling: [String: StringOrNumber]?
-+
-+    enum CodingKeys: String, CodingKey {
-+        case modelType = "model_type"
-+        case hiddenSize = "hidden_size"
-+        case hiddenLayers = "num_hidden_layers"
-+        case intermediateSize = "intermediate_size"
-+        case attentionHeads = "num_attention_heads"
-+        case headDim = "head_dim"
-+        case rmsNormEps = "rms_norm_eps"
-+        case vocabularySize = "vocab_size"
-+        case kvHeads = "num_key_value_heads"
-+        case ropeTheta = "rope_theta"
-+        case ropeLocalBaseFreq = "rope_local_base_freq"
-+        case ropeTraditional = "rope_traditional"
-+        case queryPreAttnScalar = "query_pre_attn_scalar"
-+        case slidingWindow = "sliding_window"
-+        case slidingWindowPattern = "sliding_window_pattern"
-+        case maxPositionEmbeddings = "max_position_embeddings"
-+        case ropeScaling = "rope_scaling"
-+    }
-+
-+    enum VLMCodingKeys: String, CodingKey {
-+        case textConfig = "text_config"
-+    }
-+
-+    /// Initializes a configuration by decoding from the given decoder.
-+    ///
-+    /// This initializer automatically handles configurations that are nested under a `text_config` key,
-+    /// which is common for models converted from Vision-Language Model (VLM) checkpoints.
-+    public init(from decoder: Decoder) throws {
-+        let nestedContainer = try decoder.container(keyedBy: VLMCodingKeys.self)
-+
-+        let container =
-+            if nestedContainer.contains(.textConfig) {
-+                try nestedContainer.nestedContainer(keyedBy: CodingKeys.self, forKey: .textConfig)
-+            } else {
-+                try decoder.container(keyedBy: CodingKeys.self)
-+            }
-+
-+        modelType = try container.decode(String.self, forKey: .modelType)
-+        hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 1152
-+        hiddenLayers = try container.decodeIfPresent(Int.self, forKey: .hiddenLayers) ?? 26
-+        intermediateSize =
-+            try container.decodeIfPresent(Int.self, forKey: .intermediateSize) ?? 6912
-+        attentionHeads = try container.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? 4
-+        headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) ?? 256
-+        rmsNormEps = try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1.0e-6
-+        vocabularySize = try container.decodeIfPresent(Int.self, forKey: .vocabularySize) ?? 262144
-+        kvHeads = try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? 1
-+        ropeTheta = try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1_000_000.0
-+        ropeLocalBaseFreq =
-+            try container.decodeIfPresent(Float.self, forKey: .ropeLocalBaseFreq) ?? 10_000.0
-+        ropeTraditional =
-+            try container.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
-+        queryPreAttnScalar =
-+            try container.decodeIfPresent(Float.self, forKey: .queryPreAttnScalar) ?? 256
-+        slidingWindow = try container.decodeIfPresent(Int.self, forKey: .slidingWindow) ?? 512
-+        slidingWindowPattern =
-+            try container.decodeIfPresent(Int.self, forKey: .slidingWindowPattern) ?? 6
-+        maxPositionEmbeddings =
-+            try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
-+        ropeScaling = try container.decodeIfPresent(
-+            [String: StringOrNumber].self, forKey: .ropeScaling)
-+    }
-+}
-+
-+// MARK: - Attention
-+
-+/// Multi-head attention module for Gemma 3.
-+///
-+/// This module implements the self-attention mechanism, supporting both global and sliding window attention
-+/// patterns as determined by the model's configuration and layer index.
-+private class Attention: Module {
-+    let nHeads: Int
-+    let nKVHeads: Int
-+    let repeats: Int
-+    let headDim: Int
-+    let layerIdx: Int
-+    let scale: Float
-+    let isSliding: Bool
-+    let slidingWindow: Int
-+    let slidingWindowPattern: Int
-+
-+    @ModuleInfo(key: "q_proj") var queryProj: Linear
-+    @ModuleInfo(key: "k_proj") var keyProj: Linear
-+    @ModuleInfo(key: "v_proj") var valueProj: Linear
-+    @ModuleInfo(key: "o_proj") var outputProj: Linear
-+
-+    @ModuleInfo(key: "q_norm") var queryNorm: Gemma.RMSNorm
-+    @ModuleInfo(key: "k_norm") var keyNorm: Gemma.RMSNorm
-+
-+    @ModuleInfo var rope: RoPE
-+
-+    /// Initializes an attention module.
-+    ///
-+    /// - Parameters:
-+    ///   - config: The configuration defining dimensions and patterns.
-+    ///   - layerIdx: The index of the current layer in the transformer stack.
-+    init(_ config: Gemma3Configuration, layerIdx: Int) {
-+        let dim = config.hiddenSize
-+        self.nHeads = config.attentionHeads
-+        self.nKVHeads = config.kvHeads
-+        self.repeats = nHeads / nKVHeads
-+        self.headDim = config.headDim
-+        self.layerIdx = layerIdx
-+        self.slidingWindow = config.slidingWindow
-+        self.slidingWindowPattern = config.slidingWindowPattern
-+
-+        self.scale = pow(config.queryPreAttnScalar, -0.5)
-+
-+        self._queryProj.wrappedValue = Linear(dim, nHeads * headDim, bias: false)
-+        self._keyProj.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
-+        self._valueProj.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
-+        self._outputProj.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
-+
-+        self._queryNorm.wrappedValue = Gemma.RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-+        self._keyNorm.wrappedValue = Gemma.RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-+
-+        self.isSliding = (layerIdx + 1) % config.slidingWindowPattern != 0
-+
-+        if isSliding {
-+            self.rope = RoPE(
-+                dimensions: headDim,
-+                traditional: false,
-+                base: config.ropeLocalBaseFreq
-+            )
-+        } else {
-+            self.rope = RoPE(
-+                dimensions: headDim,
-+                traditional: false,
-+                base: config.ropeTheta
-+            )
-+        }
-+
-+        super.init()
-+    }
-+
-+    /// Computes the attention mechanism.
-+    ///
-+    /// - Parameters:
-+    ///   - x: Input array of shape `[Batch, Length, HiddenSize]`.
-+    ///   - mask: The attention mask mode (e.g., causal).
-+    /// - Returns: Processed array of shape `[Batch, Length, HiddenSize]`.
-+    func callAsFunction(
-+        _ x: MLXArray,
-+        mask: MLXFast.ScaledDotProductAttentionMaskMode
-+    ) -> MLXArray {
-+        let (B, L) = (x.dim(0), x.dim(1))
-+
-+        var queries = queryProj(x)
-+        var keys = keyProj(x)
-+        var values = valueProj(x)
-+
-+        queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
-+        keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
-+        values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
-+
-+        queries = queryNorm(queries)
-+        keys = keyNorm(keys)
-+
-+        queries = rope(queries)
-+        keys = rope(keys)
-+
-+        let output = MLXFast.scaledDotProductAttention(
-+            queries: queries,
-+            keys: keys,
-+            values: values,
-+            scale: scale,
-+            mask: mask
-+        )
-+        .transposed(0, 2, 1, 3)
-+        .reshaped(B, L, -1)
-+
-+        return outputProj(output)
-+    }
-+}
-+
-+// MARK: - MLP
-+
-+/// Multi-Layer Perceptron (MLP) module for Gemma 3.
-+///
-+/// This module implements the feed-forward network with a gated activation (SwiGLU variant using GELU).
-+private class MLP: Module {
-+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-+    @ModuleInfo(key: "down_proj") var downProj: Linear
-+    @ModuleInfo(key: "up_proj") var upProj: Linear
-+
-+    /// Initializes an MLP module.
-+    ///
-+    /// - Parameters:
-+    ///   - dimensions: The input and output dimensionality.
-+    ///   - hiddenDimensions: The intermediate dimensionality.
-+    init(dimensions: Int, hiddenDimensions: Int) {
-+        self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-+        self._downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-+        self._upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-+        super.init()
-+    }
-+
-+    /// Performs the MLP forward pass.
-+    ///
-+    /// - Parameter x: Input array of shape `[..., dimensions]`.
-+    /// - Returns: Processed array of shape `[..., dimensions]`.
-+    func callAsFunction(_ x: MLXArray) -> MLXArray {
-+        return downProj(geluApproximate(gateProj(x)) * upProj(x))
-+    }
-+}
-+
-+// MARK: - TransformerBlock
-+
-+/// A single Transformer block for Gemma 3.
-+///
-+/// Each block consists of an attention layer and an MLP layer, with pre- and post-normalization
-+/// and residual connections.
-+private class TransformerBlock: Module {
-+    @ModuleInfo(key: "self_attn") var selfAttention: Attention
-+    @ModuleInfo var mlp: MLP
-+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma.RMSNorm
-+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: Gemma.RMSNorm
-+    @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: Gemma.RMSNorm
-+    @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm: Gemma.RMSNorm
-+
-+    /// Initializes a transformer block.
-+    ///
-+    /// - Parameters:
-+    ///   - config: The model configuration.
-+    ///   - layerIdx: The index of this block in the stack.
-+    init(_ config: Gemma3Configuration, layerIdx: Int) {
-+        self._selfAttention.wrappedValue = Attention(config, layerIdx: layerIdx)
-+        self.mlp = MLP(dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
-+
-+        self._inputLayerNorm.wrappedValue = Gemma.RMSNorm(
-+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-+        self._postAttentionLayerNorm.wrappedValue = Gemma.RMSNorm(
-+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-+        self._preFeedforwardLayerNorm.wrappedValue = Gemma.RMSNorm(
-+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-+        self._postFeedforwardLayerNorm.wrappedValue = Gemma.RMSNorm(
-+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-+
-+        super.init()
-+    }
-+
-+    /// Processes inputs through the transformer block.
-+    ///
-+    /// - Parameters:
-+    ///   - x: Input array of shape `[Batch, Length, HiddenSize]`.
-+    ///   - mask: The attention mask mode.
-+    /// - Returns: Processed array of shape `[Batch, Length, HiddenSize]`.
-+    func callAsFunction(
-+        _ x: MLXArray,
-+        mask: MLXFast.ScaledDotProductAttentionMaskMode
-+    ) -> MLXArray {
-+        let inputNorm = inputLayerNorm(x)
-+        let r = selfAttention(inputNorm, mask: mask)
-+        let attnNorm = postAttentionLayerNorm(r)
-+        let h = Gemma.clipResidual(x, attnNorm)
-+        let preMLPNorm = preFeedforwardLayerNorm(h)
-+        let r2 = mlp(preMLPNorm)
-+        let postMLPNorm = postFeedforwardLayerNorm(r2)
-+        let out = Gemma.clipResidual(h, postMLPNorm)
-+        return out
-+    }
-+}
-+
-+// MARK: - Gemma3ModelBackbone
-+
-+/// The core backbone of the Gemma 3 model.
-+///
-+/// This module handles token embeddings, the sequence of transformer blocks, and the final normalization.
-+/// It is used as the base for the embedding model.
-+public class Gemma3ModelBackbone: Module {
-+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-+    @ModuleInfo fileprivate var layers: [TransformerBlock]
-+    @ModuleInfo var norm: Gemma.RMSNorm
-+
-+    let config: Gemma3Configuration
-+
-+    /// Initializes the model backbone.
-+    ///
-+    /// - Parameter config: The model configuration.
-+    public init(_ config: Gemma3Configuration) {
-+        self.config = config
-+
-+        self._embedTokens.wrappedValue = Embedding(
-+            embeddingCount: config.vocabularySize,
-+            dimensions: config.hiddenSize
-+        )
-+
-+        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { layerIdx in
-+            TransformerBlock(config, layerIdx: layerIdx)
-+        }
-+
-+        self._norm.wrappedValue = Gemma.RMSNorm(
-+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-+
-+        super.init()
-+    }
-+
-+    /// Processes input tokens through the model backbone.
-+    ///
-+    /// - Parameter inputs: Array of token IDs of shape `[Batch, Length]`.
-+    /// - Returns: Final hidden states of shape `[Batch, Length, HiddenSize]`.
-+    public func callAsFunction(_ inputs: MLXArray) -> MLXArray {
-+        var h = embedTokens(inputs)
-+        let scale = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
-+        h = h * scale.asType(h.dtype)
-+
-+        let globalMask = createAttentionMask(h: h, cache: nil as KVCache?)
-+        let slidingWindowMask =
-+            if config.slidingWindowPattern > 1 {
-+                createAttentionMask(h: h, cache: nil as KVCache?, windowSize: config.slidingWindow)
-+            } else {
-+                MLXFast.ScaledDotProductAttentionMaskMode.none
-+            }
-+
-+        for (i, layer) in layers.enumerated() {
-+            let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
-+            let mask = isGlobal ? globalMask : slidingWindowMask
-+            h = layer(h, mask: mask)
-+        }
-+        return norm(h)
-+    }
-+}
-+
-+// MARK: - EmbeddingGemma
-+
-+/// A text embedding model based on Gemma 3.
-+///
-+/// This class conforms to `EmbeddingModel` and provides high-quality text embeddings by passing
-+/// inputs through a `Gemma3ModelBackbone`, followed by mean pooling and a projection head.
-+public class EmbeddingGemma: Module, EmbeddingModel {
-+    @ModuleInfo(key: "model") private var backbone: Gemma3ModelBackbone
-+    @ModuleInfo private var dense: [Module]
-+
-+    /// The model configuration.
-+    public let config: Gemma3Configuration
-+
-+    /// The size of the vocabulary.
-+    public var vocabularySize: Int { config.vocabularySize }
-+
-+    /// Initializes the embedding model.
-+    ///
-+    /// - Parameter config: The model configuration.
-+    public init(_ config: Gemma3Configuration) {
-+        self.config = config
-+        self._backbone.wrappedValue = Gemma3ModelBackbone(config)
-+
-+        self._dense.wrappedValue = []
-+        super.init()
-+    }
-+
-+    /// Generates embeddings for the given inputs.
-+    ///
-+    /// - Parameters:
-+    ///   - inputs: Input token indices of shape `[Batch, Length]`.
-+    ///   - positionIds: Optional indices for positional information.
-+    ///   - tokenTypeIds: Optional indices for segment/type information.
-+    ///   - attentionMask: Optional mask for padding tokens.
-+    /// - Returns: An `EmbeddingModelOutput` containing the full hidden states and the pooled sentence embedding.
-+    public func callAsFunction(
-+        _ inputs: MLXArray, positionIds: MLXArray?, tokenTypeIds: MLXArray?,
-+        attentionMask: MLXArray?
-+    ) -> EmbeddingModelOutput {
-+        var inp = inputs
-+        if inp.ndim == 1 {
-+            inp = inp.reshaped(1, -1)
-+        }
-+
-+        let hiddenStates = backbone(inp)
-+
-+        // mean pooling: average all non-padding tokens
-+        let notPadding = (attentionMask ?? (inp .!= 0))
-+        let sum = (hiddenStates * notPadding[.ellipsis, .newAxis]).sum(axis: 1)
-+        let nonMasked = notPadding.sum(axis: -1, keepDims: true)
-+        var out = sum / nonMasked
-+
-+        // pass through projection head (if present)
-+        for layer in self.dense {
-+            if let linear = layer as? Linear {
-+                out = linear(out)
-+            } else if let quantized = layer as? QuantizedLinear {
-+                out = quantized(out)
-+            }
-+        }
-+
-+        // normalize: L2 normalization for cosine similarity compatibility
-+        let pooledOutput =
-+            out
-+            .asType(.float32)
-+            .l2Normalized(eps: 1e-6)
-+
-+        return EmbeddingModelOutput(hiddenStates: hiddenStates, pooledOutput: pooledOutput)
-+    }
-+
-+    /// Preprocesses the weights, handling key remapping and vocabulary truncation.
-+    ///
-+    /// - Parameter weights: The original dictionary of weights.
-+    /// - Returns: A sanitized dictionary of weights compatible with the model structure.
-+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-+        var processedWeights = weights
-+
-+        // Support language_model prefix from VLMs
-+        let unflattened = ModuleParameters.unflattened(weights)
-+        if let lm = unflattened["language_model"] {
-+            processedWeights = Dictionary(uniqueKeysWithValues: lm.flattened())
-+        }
-+
-+        // Initialize projection head if weights are present
-+        if processedWeights.keys.contains(where: { $0.hasPrefix("dense.") }) {
-+            self._dense.wrappedValue = [
-+                Linear(config.hiddenSize, config.intermediateSize, bias: false),
-+                Linear(config.intermediateSize, config.hiddenSize, bias: false),
-+            ]
-+        }
-+
-+        // Truncate vocab if weights were trained with extra padding tokens
-+        let expectedVocab = config.vocabularySize
-+        if let embedWeight = processedWeights["model.embed_tokens.weight"],
-+            embedWeight.dim(0) > expectedVocab
-+        {
-+            processedWeights["model.embed_tokens.weight"] = embedWeight[0 ..< expectedVocab]
-+        }
-+
-+        // Filter out unused keys for embedding
-+        return processedWeights.filter { (key, _) in
-+            !key.contains("self_attn.rotary_emb.inv_freq") && !key.contains("lm_head")
-+        }
-+    }
-+}
-diff --git a/Libraries/MLXEmbedders/Pooling.swift b/Libraries/MLXEmbedders/Pooling.swift
-index d579c44..64d3256 100644
---- a/Libraries/MLXEmbedders/Pooling.swift
-+++ b/Libraries/MLXEmbedders/Pooling.swift
-@@ -164,7 +164,7 @@ public class Pooling: Module {
-         }
- 
-         if normalize {
--            pooled = pooled / norm(pooled, axis: -1, keepDims: true)
-+            pooled = pooled.l2Normalized()
-         }
- 
-         return pooled
-diff --git a/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift b/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
-index da2a18c..3f7b0b5 100644
---- a/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
-+++ b/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
-@@ -3,6 +3,8 @@
  import Foundation
  import MLX
- import MLXEmbedders
-+import MLXLMCommon
-+import MLXVLM
- import Testing
++import MLXNN
  import Tokenizers
  
-@@ -81,4 +83,69 @@ struct EmbedderIntegrationtests {
-             )
+ /// A `LogitSampler` is responsible for sampling `logits` produced by
+@@ -31,7 +32,7 @@ public protocol LogitSampler {
+ /// ```
+ ///
+ /// See also: ``LogitSampler``
+-public protocol LogitProcessor: Sendable {
++public protocol LogitProcessor {
+ 
+     /// called before token generation starts with the text tokens of the prompt
+     mutating func prompt(_ prompt: MLXArray)
+@@ -206,11 +207,17 @@ public struct ArgMaxSampler: LogitSampler {
+ 
+ /// Sampler that uses probability filters (`topP`, `topK`, `minP`) and `temperature`
+ /// to sample the logits.
++///
++/// Filters are applied in the same order as Python mlx-lm: top_p → min_p → top_k.
++/// Each filter operates on the full vocabulary in original token order, masking
++/// rejected tokens with `-inf`. This matches the composable filter chain in
++/// `mlx_lm.sample_utils.make_sampler`.
+ public struct TopPSampler: LogitSampler {
+     let temp: MLXArray
+     let topP: MLXArray?
+     let topK: Int?
+     let minP: MLXArray?
++    let negInf: MLXArray
+     let randomState: MLXRandom.RandomState
+ 
+     public init(temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0) {
+@@ -222,6 +229,7 @@ public struct TopPSampler: LogitSampler {
+         }
+         self.topK = topK > 0 ? topK : nil
+         self.minP = minP > 0 ? MLXArray(minP) : nil
++        self.negInf = MLXArray(-Float.infinity)
+         self.randomState = MLXRandom.RandomState()
+     }
+ 
+@@ -232,46 +240,55 @@ public struct TopPSampler: LogitSampler {
+         }
+ 
+         return withRandomState(randomState) {
+-            // Match mlx-lm Python behavior:
+-            // apply filtering on the base distribution, then apply temperature at sampling time.
+-            let probs = softmax(logits, axis: -1)
+-            let sortedIndices = argSort(probs, axis: -1)
+-
+-            // probs shape is [B,V] and after take it will be [1, B, V], so we squeeze it back to [B, V]
+-            let sortedProbs = take(probs, sortedIndices, axis: -1).squeezed(axis: 0)
+-
+-            var filteredProbs = sortedProbs
++            var logprobs = logSoftmax(logits)
+ 
++            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
+             if let topP {
+-                let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+-                filteredProbs = MLX.where(
+-                    cumulativeProbs .> (1 - topP), filteredProbs, zeros(like: filteredProbs))
++                logprobs = applyTopP(logprobs, topP: topP)
+             }
+-
+             if let minP {
+-                let maxProbs = sortedProbs[0..., -1].expandedDimensions(axis: -1)
+-                let keepMask = sortedProbs .>= (maxProbs * minP)
+-                filteredProbs = MLX.where(keepMask, filteredProbs, zeros(like: filteredProbs))
++                logprobs = applyMinP(logprobs, minP: minP)
+             }
+-
+             if let topK {
+-                let vocabularySize = sortedProbs.dim(-1)
+-                if topK < vocabularySize {
+-                    let cutOff = vocabularySize - topK
+-                    let sortedPositions = MLXArray(Array(0 ..< vocabularySize))
+-                    let keepMask = sortedPositions .>= cutOff
+-                    filteredProbs = MLX.where(
+-                        keepMask, filteredProbs, zeros(like: filteredProbs))
+-                }
++                logprobs = applyTopK(logprobs, topK: topK)
+             }
+ 
+-            // Always keep the maximum-probability token so sampling always has a valid candidate.
+-            filteredProbs[0..., -1] = sortedProbs[0..., -1]
+-
+-            let sortedToken = categorical(log(filteredProbs) * (1 / temp))
+-            return sortedIndices.squeezed(axis: 0)[sortedToken]
++            return categorical(logprobs * (1 / temp))
          }
      }
 +
-+    @Test("Gemma 3 Embedder integration")
-+    func testGemma3Embedder() async throws {
-+        // Gemma 3 1B model
-+        let modelId = "mlx-community/gemma-3-1b-it-qat-4bit"
-+        let modelContainer = try await loadModelContainer(configuration: .init(id: modelId))
++    /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
++    /// Matches `apply_top_p` from `mlx_lm/sample_utils.py`.
++    private func applyTopP(_ logprobs: MLXArray, topP: MLXArray) -> MLXArray {
++        let sortedIndices = argSort(logprobs, axis: -1)
++        let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
++        let sortedProbs = exp(sortedLogprobs)
++        let cumulativeProbs = cumsum(sortedProbs, axis: -1)
 +
-+        let inputs = [
-+            "The Coca-Cola Company is a soft drink company based in Atlanta, Georgia, USA.",
-+            "In the United States, PepsiCo Inc. is a leading soft drink company.",
-+        ]
-+
-+        let resultEmbeddings = await modelContainer.perform {
-+            (model: EmbeddingModel, tokenizer: Tokenizer, pooling: Pooling) -> [[Float]] in
-+            let encoded = inputs.map {
-+                tokenizer.encode(text: $0, addSpecialTokens: true)
-+            }
-+            // Pad to longest sequence
-+            let maxLength = encoded.reduce(into: 1) { acc, elem in
-+                acc = max(acc, elem.count)
-+            }
-+
-+            let padded = stacked(
-+                encoded.map { elem in
-+                    MLXArray(
-+                        elem
-+                            + Array(
-+                                repeating: tokenizer.eosTokenId ?? 0,
-+                                count: maxLength - elem.count))
-+                })
-+
-+            // Mask out padding tokens
-+            let mask = (padded .!= (tokenizer.eosTokenId ?? 0))
-+            let tokenTypes = MLXArray.zeros(like: padded)
-+
-+            // Generate embeddings. EmbeddingGemma returns a pooledOutput by default.
-+            let modelOutput = model(
-+                padded, positionIds: nil, tokenTypeIds: tokenTypes, attentionMask: mask)
-+
-+            // Pooling strategy .cls (the default if no pooling config exists)
-+            // will pick up the pooledOutput from the EmbeddingGemma model.
-+            let result = pooling(
-+                modelOutput,
-+                normalize: true, applyLayerNorm: true
-+            )
-+            result.eval()
-+            return result.map { $0.asArray(Float.self) }
-+        }
-+
-+        #expect(resultEmbeddings.count == inputs.count, "Should have one embedding per input")
-+        for embedding in resultEmbeddings {
-+            // Gemma 3 1B hidden size is 1152
-+            #expect(embedding.count == 1152, "Gemma 3 1B embedding size should be 1152")
-+
-+            // Verify normalization (L2 norm should be ~1.0)
-+            let l2Norm = sqrt(embedding.map { $0 * $0 }.reduce(0, +))
-+            #expect(abs(l2Norm - 1.0) < 0.05, "Embeddings should be approximately L2-normalized")
-+        }
-+
-+        // Basic semantic check: similarity between related sentences should be positive
-+        let similarity = zip(resultEmbeddings[0], resultEmbeddings[1]).map(*).reduce(0, +)
-+        //print("similarity: \(similarity)")
-+        #expect(similarity > 0.0, "Similarity between related sentences should be positive")
++        // Mask low-probability tail in sorted order, scatter back to original vocab order.
++        let filtered = MLX.where(cumulativeProbs .> (1 - topP), sortedLogprobs, negInf)
++        return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
 +    }
 +
++    /// Keep tokens with probability >= maxProb * minP.
++    /// Matches `apply_min_p` from `mlx_lm/sample_utils.py`.
++    private func applyMinP(_ logprobs: MLXArray, minP: MLXArray) -> MLXArray {
++        // threshold in log-space: log(maxProb * minP) = maxLogprob + log(minP)
++        let maxLogprob = logprobs.max(axis: -1, keepDims: true)
++        let threshold = maxLogprob + log(minP)
++        return MLX.where(logprobs .>= threshold, logprobs, negInf)
++    }
++
++    /// Keep only the top-k highest-probability tokens.
++    /// Mirrors `apply_top_k` from `mlx_lm/sample_utils.py`.
++    private func applyTopK(_ logprobs: MLXArray, topK: Int) -> MLXArray {
++        let vocabularySize = logprobs.dim(-1)
++        guard topK < vocabularySize else { return logprobs }
++        // O(V) partition on negated logprobs so top-k land at [0, topK).
++        // Indices at [topK, V) are the tokens to mask out.
++        let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
++        return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
++    }
  }
+ 
+ /// Sampler that uses `temperature` to sample the logits.
+@@ -291,151 +308,149 @@ public struct CategoricalSampler: LogitSampler {
+     }
+ }
+ 
+-/// Processor that implements a `repetitionPenalty`
+-public struct RepetitionContext: LogitProcessor {
+-    /// tokens in the repetition context sliding window
+-    var tokens = [Int]()
++/// GPU-resident ring buffer of recent token IDs.
++///
++/// Shared by penalty processors to avoid duplicating ring buffer logic.
++/// Uses `MLX.where` mask operations for GPU-only updates (no CPU←GPU sync),
++/// preserving `asyncEval()` pipelining in `TokenIterator`.
++struct TokenRing {
++    private(set) var buffer: MLXArray
++    private(set) var count = 0
++    private var writeIndex = 0
++    let capacity: Int
++    private let positions: MLXArray
++
++    init(capacity: Int) {
++        precondition(capacity > 0)
++        self.capacity = capacity
++        self.buffer = MLXArray.zeros([capacity], type: Int32.self)
++        self.positions = MLXArray.arange(capacity)
++    }
+ 
+-    /// current write index into the tokens circular array
+-    var index = 0
++    /// The valid portion of the ring (all of it once full), or `nil` if empty.
++    var validTokens: MLXArray? {
++        guard count > 0 else { return nil }
++        return count < capacity ? buffer[..<count] : buffer
++    }
+ 
+-    /// penalty factor for repeating tokens
+-    let repetitionPenalty: Float
++    /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
++    mutating func loadPrompt(_ prompt: MLXArray) {
++        let n = prompt.dim(0)
++        let promptTokens = prompt.asType(.int32)
++        if n <= capacity {
++            if n < capacity {
++                let padding = MLXArray.zeros([capacity - n], type: Int32.self)
++                buffer = concatenated([promptTokens.reshaped(-1), padding])
++            } else {
++                buffer = promptTokens.reshaped(-1)
++            }
++            count = n
++            writeIndex = n % capacity
++        } else {
++            buffer = promptTokens[(-capacity)...].reshaped(-1)
++            count = capacity
++            writeIndex = 0
++        }
++    }
+ 
+-    /// number of tokens to consider for repetition penalty
+-    let repetitionContextSize: Int
++    /// Append a single token using GPU-only mask write (no CPU←GPU sync).
++    mutating func append(_ token: MLXArray) {
++        let mask = positions .== Int32(writeIndex)
++        buffer = MLX.where(mask, token.asType(.int32), buffer)
++        writeIndex = (writeIndex + 1) % capacity
++        count = min(count + 1, capacity)
++    }
++}
++
++/// Processor that implements a `repetitionPenalty`.
++public struct RepetitionContext: LogitProcessor {
++    private var ring: TokenRing
++    let repetitionPenalty: Float
+ 
+     public init(repetitionPenalty: Float, repetitionContextSize: Int) {
+-        precondition(repetitionContextSize > 0)
+         self.repetitionPenalty = repetitionPenalty
+-        self.repetitionContextSize = repetitionContextSize
++        self.ring = TokenRing(capacity: repetitionContextSize)
+     }
+ 
+     mutating public func prompt(_ prompt: MLXArray) {
+-        if prompt.shape[0] <= repetitionContextSize {
+-            self.tokens = prompt.asArray(Int.self)
+-        } else {
+-            self.tokens = prompt[(-repetitionContextSize)...].asArray(Int.self)
+-        }
++        ring.loadPrompt(prompt)
+     }
+ 
+     public func process(logits: MLXArray) -> MLXArray {
+-        if tokens.count > 0 {
+-            let indices = MLXArray(tokens.map { UInt32($0) })
+-            var selectedLogits = logits[0..., indices]
++        guard let indices = ring.validTokens?.asType(.uint32) else { return logits }
++        var selectedLogits = logits[0..., indices]
+ 
+-            selectedLogits = MLX.where(
+-                selectedLogits .< 0, selectedLogits * repetitionPenalty,
+-                selectedLogits / repetitionPenalty)
+-
+-            logits[0..., indices] = selectedLogits
+-            return logits
+-        }
++        selectedLogits = MLX.where(
++            selectedLogits .< 0, selectedLogits * repetitionPenalty,
++            selectedLogits / repetitionPenalty)
+ 
++        logits[0..., indices] = selectedLogits
+         return logits
+     }
+ 
+     mutating public func didSample(token: MLXArray) {
+-        if tokens.count >= repetitionContextSize {
+-            tokens[index] = token.item(Int.self)
+-            index = (index + 1) % repetitionContextSize
+-        } else {
+-            tokens.append(token.item(Int.self))
+-        }
++        ring.append(token)
+     }
+ }
+ 
+ /// Processor that applies an additive presence penalty to tokens in a recent context window.
++///
++/// The penalty is applied once per unique token via scatter-write (writing the
++/// same value to the same index multiple times is idempotent).
+ public struct PresencePenaltyContext: LogitProcessor {
+-    var tokens = [Int]()
+-    var index = 0
+-
++    private var ring: TokenRing
+     let presencePenalty: Float
+-    let presenceContextSize: Int
+ 
+     public init(presencePenalty: Float, presenceContextSize: Int) {
+-        precondition(presenceContextSize > 0)
+         self.presencePenalty = presencePenalty
+-        self.presenceContextSize = presenceContextSize
++        self.ring = TokenRing(capacity: presenceContextSize)
+     }
+ 
+     mutating public func prompt(_ prompt: MLXArray) {
+-        if prompt.shape[0] <= presenceContextSize {
+-            self.tokens = prompt.asArray(Int.self)
+-        } else {
+-            self.tokens = prompt[(-presenceContextSize)...].asArray(Int.self)
+-        }
++        ring.loadPrompt(prompt)
+     }
+ 
+     public func process(logits: MLXArray) -> MLXArray {
+-        if tokens.isEmpty {
+-            return logits
+-        }
+-
+-        let uniqueTokens = Array(Set(tokens))
+-        let indices = MLXArray(uniqueTokens.map { UInt32($0) })
++        guard let indices = ring.validTokens?.asType(.uint32) else { return logits }
+         logits[0..., indices] = logits[0..., indices] - presencePenalty
+         return logits
+     }
+ 
+     mutating public func didSample(token: MLXArray) {
+-        if tokens.count >= presenceContextSize {
+-            tokens[index] = token.item(Int.self)
+-            index = (index + 1) % presenceContextSize
+-        } else {
+-            tokens.append(token.item(Int.self))
+-        }
++        ring.append(token)
+     }
+ }
+ 
+ /// Processor that applies an additive frequency penalty to tokens in a recent context window.
++///
++/// Frequency counting is performed on GPU via `scatter_add` to build a histogram
++/// of token occurrences, avoiding CPU←GPU synchronization.
+ public struct FrequencyPenaltyContext: LogitProcessor {
+-    var tokens = [Int]()
+-    var index = 0
+-
++    private var ring: TokenRing
+     let frequencyPenalty: Float
+-    let frequencyContextSize: Int
+ 
+     public init(frequencyPenalty: Float, frequencyContextSize: Int) {
+-        precondition(frequencyContextSize > 0)
+         self.frequencyPenalty = frequencyPenalty
+-        self.frequencyContextSize = frequencyContextSize
++        self.ring = TokenRing(capacity: frequencyContextSize)
+     }
+ 
+     mutating public func prompt(_ prompt: MLXArray) {
+-        if prompt.shape[0] <= frequencyContextSize {
+-            self.tokens = prompt.asArray(Int.self)
+-        } else {
+-            self.tokens = prompt[(-frequencyContextSize)...].asArray(Int.self)
+-        }
++        ring.loadPrompt(prompt)
+     }
+ 
+     public func process(logits: MLXArray) -> MLXArray {
+-        if tokens.isEmpty {
+-            return logits
+-        }
++        guard let validTokens = ring.validTokens else { return logits }
+ 
+-        var counts = [Int: Int]()
+-        for token in tokens {
+-            counts[token, default: 0] += 1
+-        }
++        let vocabSize = logits.dim(-1)
++        let ones = MLXArray.ones([validTokens.dim(0)], type: Float32.self)
++        let histogram = MLXArray.zeros([vocabSize], type: Float32.self)
++            .at[validTokens.asType(.int32)].add(ones)
+ 
+-        let orderedTokens = Array(counts.keys)
+-        let indices = MLXArray(orderedTokens.map { UInt32($0) })
+-        let penalties = MLXArray(
+-            orderedTokens.map { frequencyPenalty * Float(counts[$0] ?? 0) }
+-        )
+-        logits[0..., indices] = logits[0..., indices] - penalties
+-        return logits
++        return logits - (histogram * frequencyPenalty).reshaped(1, -1)
+     }
+ 
+     mutating public func didSample(token: MLXArray) {
+-        if tokens.count >= frequencyContextSize {
+-            tokens[index] = token.item(Int.self)
+-            index = (index + 1) % frequencyContextSize
+-        } else {
+-            tokens.append(token.item(Int.self))
+-        }
++        ring.append(token)
+     }
+ }
+ 
+
+commit 9a8e3a5b0f429fe6b66b956d893f44ffcbc15b5f
+Author: David Koski <46639364+davidkoski@users.noreply.github.com>
+Date:   Thu Mar 26 09:30:19 2026 -0700
+
+    add missing context/toolcall parameters (#140)
+    
+    * add missing context/toolcall parameters
+    
+    - see #139
+
+diff --git a/Libraries/MLXLMCommon/ModelContainer.swift b/Libraries/MLXLMCommon/ModelContainer.swift
+index 63ae270..6ed5586 100644
+--- a/Libraries/MLXLMCommon/ModelContainer.swift
++++ b/Libraries/MLXLMCommon/ModelContainer.swift
+@@ -215,6 +215,7 @@ public final class ModelContainer: Sendable {
+     ///
+     /// - Parameter messages: Array of message dictionaries with "role" and "content" keys
+     /// - Returns: Array of token IDs
++    @available(*, deprecated, message: "Use applyChatTemplate directly on tokenizer")
+     public func applyChatTemplate(messages: [[String: String]]) async throws -> [Int] {
+         let tokenizer = await self.tokenizer
+         return try tokenizer.applyChatTemplate(messages: messages)
+diff --git a/Libraries/MLXVLM/Models/FastVLM.swift b/Libraries/MLXVLM/Models/FastVLM.swift
+index 038d312..16716af 100644
+--- a/Libraries/MLXVLM/Models/FastVLM.swift
++++ b/Libraries/MLXVLM/Models/FastVLM.swift
+@@ -989,7 +989,9 @@ public struct FastVLMProcessor: UserInputProcessor {
+ 
+         if input.images.isEmpty {
+             // No image scenario
+-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++            let promptTokens = try tokenizer.applyChatTemplate(
++                messages: messages, tools: input.tools,
++                additionalContext: input.additionalContext)
+             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+             let mask = ones(like: tokensArray)
+             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+@@ -1000,7 +1002,9 @@ public struct FastVLMProcessor: UserInputProcessor {
+         }
+ 
+         // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
+-        let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++        let promptTokens = try tokenizer.applyChatTemplate(
++            messages: messages, tools: input.tools,
++            additionalContext: input.additionalContext)
+         let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+ 
+         // Find <image> and replace with token id -200
+diff --git a/Libraries/MLXVLM/Models/Gemma3.swift b/Libraries/MLXVLM/Models/Gemma3.swift
+index aabc3ad..df72590 100644
+--- a/Libraries/MLXVLM/Models/Gemma3.swift
++++ b/Libraries/MLXVLM/Models/Gemma3.swift
+@@ -1067,7 +1067,9 @@ public struct Gemma3Processor: UserInputProcessor {
+         // Use structured content message generator for Gemma3's chat template
+         let messages = Qwen2VLMessageGenerator().generate(from: input)
+ 
+-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++        var promptTokens = try tokenizer.applyChatTemplate(
++            messages: messages, tools: input.tools,
++            additionalContext: input.additionalContext)
+ 
+         // Process images if any
+         var processedImage: LMInput.ProcessedImage?
+diff --git a/Libraries/MLXVLM/Models/Qwen25VL.swift b/Libraries/MLXVLM/Models/Qwen25VL.swift
+index 01a8e20..c380d10 100644
+--- a/Libraries/MLXVLM/Models/Qwen25VL.swift
++++ b/Libraries/MLXVLM/Models/Qwen25VL.swift
+@@ -723,7 +723,9 @@ public struct Qwen25VLProcessor: UserInputProcessor {
+     public func prepare(input: UserInput) async throws -> LMInput {
+         let messages = Qwen2VLMessageGenerator().generate(from: input)
+ 
+-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++        var promptTokens = try tokenizer.applyChatTemplate(
++            messages: messages, tools: input.tools,
++            additionalContext: input.additionalContext)
+ 
+         // Text-only input
+         if input.images.isEmpty, input.videos.isEmpty {
+diff --git a/Libraries/MLXVLM/Models/Qwen2VL.swift b/Libraries/MLXVLM/Models/Qwen2VL.swift
+index 389c6df..2f44f04 100644
+--- a/Libraries/MLXVLM/Models/Qwen2VL.swift
++++ b/Libraries/MLXVLM/Models/Qwen2VL.swift
+@@ -562,7 +562,9 @@ public struct Qwen2VLProcessor: UserInputProcessor {
+     public func prepare(input: UserInput) async throws -> LMInput {
+         let messages = Qwen2VLMessageGenerator().generate(from: input)
+ 
+-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++        var promptTokens = try tokenizer.applyChatTemplate(
++            messages: messages, tools: input.tools,
++            additionalContext: input.additionalContext)
+ 
+         // Text-only input
+         if input.images.isEmpty, input.videos.isEmpty {
+diff --git a/Libraries/MLXVLM/Models/SmolVLM2.swift b/Libraries/MLXVLM/Models/SmolVLM2.swift
+index a4b317e..efb9752 100644
+--- a/Libraries/MLXVLM/Models/SmolVLM2.swift
++++ b/Libraries/MLXVLM/Models/SmolVLM2.swift
+@@ -225,7 +225,9 @@ public struct SmolVLMProcessor: UserInputProcessor {
+ 
+         if input.images.isEmpty && input.videos.isEmpty {
+             // No image scenario
+-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++            let promptTokens = try tokenizer.applyChatTemplate(
++                messages: messages, tools: input.tools,
++                additionalContext: input.additionalContext)
+             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
+             let mask = ones(like: tokensArray)
+             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+@@ -236,7 +238,9 @@ public struct SmolVLMProcessor: UserInputProcessor {
+             }
+ 
+             // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
+-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
++            let promptTokens = try tokenizer.applyChatTemplate(
++                messages: messages, tools: input.tools,
++                additionalContext: input.additionalContext)
+             let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
+ 
+             let image = try input.images[0].asCIImage().toSRGB()
+
+commit 9211280c201f5b3d85e07cf2525cd0751b63a12e
+Author: David Koski <46639364+davidkoski@users.noreply.github.com>
+Date:   Thu Mar 26 08:32:05 2026 -0700
+
+    fix unreliable tests (#128)
+    
+    * fix unreliable tests
+    
+    - fixes https://github.com/ml-explore/mlx-swift-lm/issues/119
+    - make the random weight model and tokenizer behave in a predictable way
+
+diff --git a/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift b/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
+index 3f7b0b5..ba31146 100644
+--- a/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
++++ b/Tests/MLXLMIntegrationTests/EmbedderIntegrationTests.swift
+@@ -53,13 +53,7 @@ struct EmbedderIntegrationtests {
+ 
+     @Test("MLXEmbedders README.md example")
+     func testReadMeExample() async throws {
+-        guard let (searchInputs, resultEmbeddings) = try? await readeMeExampleResult() else {
+-            throw NSError(
+-                domain: "EmbedderIntegrationtests",
+-                code: 1,
+-                userInfo: [NSLocalizedDescriptionKey: "Failed to get example results"]
+-            )
+-        }
++        let (searchInputs, resultEmbeddings) = try await readeMeExampleResult()
+ 
+         // Compute similarities
+         let searchQueryEmbedding = resultEmbeddings[0]
+diff --git a/Tests/MLXLMTests/ChatSessionTests.swift b/Tests/MLXLMTests/ChatSessionTests.swift
+index a2d12b9..36947a5 100644
+--- a/Tests/MLXLMTests/ChatSessionTests.swift
++++ b/Tests/MLXLMTests/ChatSessionTests.swift
+@@ -15,8 +15,8 @@ public class ChatSessionTests: XCTestCase {
+     private func model() -> ModelContext {
+         let config = Gemma3TextConfiguration(
+             modelType: "text",
+-            hiddenSize: 64, hiddenLayers: 8, intermediateSize: 128, attentionHeads: 8,
+-            headDim: 256,
++            hiddenSize: 64, hiddenLayers: 8, intermediateSize: 64, attentionHeads: 4,
++            headDim: 64,
+             rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4,
+             ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,
+             ropeTraditional: false, queryPreAttnScalar: 256,
+@@ -39,11 +39,13 @@ public class ChatSessionTests: XCTestCase {
+             tokenizer: processor.tokenizer)
+     }
+ 
++    private let generationParameters = GenerateParameters(maxTokens: 50)
++
+     private let targetLength = 1
+ 
+     func testChatSessionSync() async throws {
+         let model = model()
+-        let session = ChatSession(model)
++        let session = ChatSession(model, generateParameters: generationParameters)
+ 
+         let result1 = try await session.respond(to: "hello")
+         XCTAssertGreaterThan(result1.count, targetLength, result1)
+@@ -53,7 +55,7 @@ public class ChatSessionTests: XCTestCase {
+ 
+     func testChatSessionAsync() async throws {
+         let model = model()
+-        let session = ChatSession(model)
++        let session = ChatSession(model, generateParameters: generationParameters)
+ 
+         var result1 = ""
+         for try await part in session.streamResponse(to: "hello") {
+@@ -71,7 +73,7 @@ public class ChatSessionTests: XCTestCase {
+     func testChatSessionAsyncInterrupt() async throws {
+         // interrupt the streamResponse and continue with another request
+         let model = model()
+-        let session = ChatSession(model)
++        let session = ChatSession(model, generateParameters: generationParameters)
+ 
+         for _ in 0 ..< 10 {
+             var result1 = ""
+@@ -119,7 +121,9 @@ public class ChatSessionTests: XCTestCase {
+                 ] as [String: any Sendable],
+             ] as ToolSpec
+         ]
+-        let session = ChatSession(model, tools: tools)
++        let session = ChatSession(
++            model, generateParameters: generationParameters, tools: tools
++        )
+ 
+         let result = try await session.respond(to: "What is the weather in SF?")
+         XCTAssertGreaterThan(result.count, targetLength, result)
+@@ -144,7 +148,9 @@ public class ChatSessionTests: XCTestCase {
+                 ] as [String: any Sendable],
+             ] as ToolSpec
+         ]
+-        let session = ChatSession(model, tools: tools)
++        let session = ChatSession(
++            model, generateParameters: generationParameters, tools: tools
++        )
+ 
+         var result = ""
+         for try await part in session.streamResponse(to: "hello") {
+@@ -209,7 +215,8 @@ public class ChatSessionTests: XCTestCase {
+             try await Task.sleep(for: .milliseconds(10))
+         }
+ 
+-        // try another message, wait for full completion
++        // try another message, wait for full completion (but cap the length)
++        model.session.generateParameters = self.generationParameters
+         model.respond("message2")
+         while model.isBusy {
+             try await Task.sleep(for: .milliseconds(10))
+diff --git a/Tests/MLXLMTests/TestTokenizer.swift b/Tests/MLXLMTests/TestTokenizer.swift
+index ba818cd..4908e5f 100644
+--- a/Tests/MLXLMTests/TestTokenizer.swift
++++ b/Tests/MLXLMTests/TestTokenizer.swift
+@@ -9,11 +9,18 @@ import Tokenizers
+ struct TestTokenizer: Tokenizer {
+ 
+     let length = 8
++    let maxLength = 50
+ 
+-    var vocabulary: [Int: String]
++    /// a token outside the range that the model will generate, see vocabularySize
++    let _eosTokenId = 101
++    let _unknownTokenId = 102
++
++    let vocabularySize: Int
++    let vocabulary: [Int: String]
+ 
+     init(vocabularySize: Int = 100) {
+         let letters = "abcdefghijklmnopqrstuvwxyz"
++        self.vocabularySize = vocabularySize
+         self.vocabulary = Dictionary(
+             uniqueKeysWithValues: (0 ..< vocabularySize)
+                 .map { t in
+@@ -33,8 +40,8 @@ struct TestTokenizer: Tokenizer {
+     }
+ 
+     func encode(text: String) -> [Int] {
+-        (0 ..< length).map { _ in
+-            Int.random(in: 0 ..< 100)
++        (0 ..< length).enumerated().map { (index, _) in
++            Int.random(in: 1 ..< vocabularySize)
+         }
+     }
+ 
+@@ -44,18 +51,18 @@ struct TestTokenizer: Tokenizer {
+ 
+     func decode(tokens: [Int], skipSpecialTokens: Bool) -> String {
+         var tokens = tokens
+-        if tokens.count > 50 {
+-            tokens.append(19)
++        if tokens.count > maxLength {
++            tokens.append(_eosTokenId)
+         }
+         return tokens.map { convertIdToToken($0) ?? "" }.joined(separator: " ")
+     }
+ 
+     func convertTokenToId(_ token: String) -> Int? {
+-        Int.random(in: 0 ..< 100)
++        Int.random(in: 1 ..< vocabularySize)
+     }
+ 
+     func convertIdToToken(_ id: Int) -> String? {
+-        if id == 19 {
++        if id == eosTokenId {
+             return "EOS"
+         }
+         return vocabulary[id]
+@@ -67,11 +74,11 @@ struct TestTokenizer: Tokenizer {
+ 
+     var eosToken: String? = nil
+ 
+-    var eosTokenId: Int? = 0
++    var eosTokenId: Int? { _eosTokenId }
+ 
+     var unknownToken: String? = nil
+ 
+-    var unknownTokenId: Int? = 0
++    var unknownTokenId: Int? { _unknownTokenId }
+ 
+     func applyChatTemplate(messages: [Tokenizers.Message]) throws -> [Int] {
+         encode(text: "")

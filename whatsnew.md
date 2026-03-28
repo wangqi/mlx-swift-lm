@@ -1,89 +1,97 @@
-# MLX Swift LM - What's New
+# mlx-swift-lm Upgrade Notes: tag-20260321 → tag-20260328
 
-## tag-20260321 (2026-03-21)
+## Summary
 
-### Changes from tag-20260315 to tag-20260321
-
-**Fix: LFM2 Tool Calling with Nested Parentheses (#152)**
-`PythonicToolCallParser` was rewritten to handle nested parentheses in tool-call arguments (e.g. `func(arg="value(with parens)")`). The old `.*?` non-greedy regex failed when argument values contained parentheses, silently returning `nil` instead of a parsed tool call.
-
-New strategy:
-1. **Bracket pattern first**: `\[(\w+)\((.*?)\)\]` — the required closing `\]` forces the lazy `.*?` to backtrack past any inner `)`, correctly capturing the full argument string.
-2. **Index-based fallback**: For bracket-less format (e.g. `func(args...)`), uses `firstIndex(of: "(")` + `lastIndex(of: ")")` to find the outermost parentheses, avoiding the greedy/non-greedy pitfall entirely.
-
-**Fix: Quantized BERT / NomicBert Embedding Models Crash (SIGABRT) (#153)**
-Two distinct bugs fixed in `Bert.swift` and `NomicBert.swift`:
-
-1. **SIGABRT on load** — `BertModel.pooler` and `NomicBertModel.pooler` (both `Linear?`) were not annotated with `@ModuleInfo`. During quantization, `Module.update(modules:)` replaces them with `QuantizedLinear` via the non-throwing wrapper, which internally uses `try!`. Without `@ModuleInfo`, the module lookup throws `needModuleInfo`, causing `try!` to crash with SIGABRT.
-   - Fix: Added `@ModuleInfo` to both `pooler` properties.
-
-2. **Fatal error: mask dtype mismatch** — The attention mask was cast to `embedder.wordEmbeddings.weight.dtype` (always `float32` since `Embedding` layers are unquantized). When Q/K/V projections were quantized to `float16`, `MLXFast.scaledDotProductAttention` required the mask to match the output dtype (`float16`). A `float32` mask cannot promote down to `float16`, causing a fatal error.
-   - Fix: Cast the attention mask to `embeddings.dtype` (computed after the embedding forward pass), which reflects the actual compute dtype flowing into the encoder.
-
-**New: Gemma 3 Embedding Model (#136)**
-Full Gemma 3 embedding model implementation added to `MLXEmbedders`:
-- New file `Gemma3.swift` (~496 lines) with full encoder architecture
-- `l2Normalized()` helper added to `MLXArray`
-- Model aliases registered: `gemma3`, `gemma3_text`, `gemma3n`
-- `EmbeddingModel` properties made publicly readable
-- Integration tests added
+This upgrade includes significant performance improvements, new KV cache persistence APIs, bug fixes for multi-tool-call agentic workflows, and embedding model improvements. Overall risk is **moderate**: mostly additive API changes with one dependency version bump.
 
 ---
 
-### Risk Assessment
+## Changes
 
-| Change | Risk Level | Rationale |
-|--------|-----------|-----------|
-| LFM2 tool calling parser rewrite | Low | Bug fix only; other parsers (JSON, XML) untouched; LFM2-specific path; added tests cover the fixed cases |
-| BERT/NomicBert SIGABRT fix | Low | Pure bug fix; `@ModuleInfo` annotation is additive; dtype fix only affects quantized float16 models, which previously crashed on load |
-| Gemma 3 embedding model | Low | Additive only; new file behind factory registration; no changes to existing model paths |
+### Performance (High Impact for iOS)
 
-**Overall Upgrade Risk: Low**
-All three changes are targeted bug fixes or purely additive new model support. No breaking API changes. Quantized BERT/NomicBert embedding models that previously crashed will now load and run correctly — this is a material improvement for any user running those models on-device. Recommend smoke-testing LFM2 tool calling and any BERT-based embedding flows after upgrade.
+**`perf: eliminate CPU←GPU sync in penalty processors, optimize TopPSampler (#147)`**
+
+- **+35–65% faster token generation** on Apple Silicon by removing CPU←GPU synchronization in the hot path.
+- All three penalty processors (`RepetitionContext`, `PresencePenaltyContext`, `FrequencyPenaltyContext`) previously called `token.item(Int.self)` on every generated token, forcing a GPU stall that blocked `asyncEval()` pipelining.
+- Fix: replaced Swift `[Int]` token buffers with GPU-resident MLXArray ring buffers using `MLX.where` mask operations — no `.item()` or `.asArray()` calls remain in the hot path.
+- Benchmark on Qwen3.5-4B (248K vocab, topK=20, presencePenalty=1.5): peak **70 → 95 tok/s (+35%)**, aggregate across 14 scenarios **34.6 → 57.2 tok/s (+65%)**.
+- `TopPSampler` also optimized: uses `argPartition` O(V) to find top-K candidates instead of `argSort` O(V log V) on full vocabulary, then sorts only K candidates O(K log K).
+- Sampling pipeline now mirrors Python `mlx-lm` order: `top_p → min_p → top_k`.
+
+### KV Cache Persistence (New API)
+
+**`Add KV cache initializers and cache access to ChatSession (#151)`**
+
+New prefix-caching API enables building a `KVCache` from a long shared context (system prompt + document) once, saving to disk, and restoring across sessions to skip re-prefilling the same tokens.
+
+New `ChatSession` APIs:
+```swift
+// Initialize with a pre-built cache
+ChatSession(_ model: ModelContainer, cache: [KVCache], ...)
+ChatSession(_ model: ModelContext, cache: [KVCache], ...)
+
+// Read the live cache after generation
+func currentCache() async -> [KVCache]?
+
+// Save the live cache to disk (.safetensors)
+func saveCache(to url: URL) async throws
+```
+
+**`Add copy() to KVCache protocol and all implementations (#158)`**
+
+- New `copy()` method on `KVCache` protocol enables deep-copying a prefix cache to reuse across multiple `ChatSession` instances without reloading from disk.
+- Implemented for: `KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `ChunkedKVCache`, `ArraysCache`, `MambaCache`, `CacheList`.
+- **mlx-swift dependency bumped to 0.31.1** — picks up fix for `array[.ellipsis]` returning `self` instead of a copy.
+
+### Bug Fixes
+
+**`Handle multiple tool calls in ChatSession (#162)`**
+
+- Fixes #134: the generation loop was breaking on the first tool call, canceling the stream, and losing subsequent tool calls.
+- Now drains the full stream, collects all pending tool calls into `[ToolCall]`, dispatches them all, then restarts with all tool results. Skips dispatch if `Task.isCancelled`.
+- Critical fix for agentic workflows that issue parallel tool calls in a single model turn.
+
+**`add missing context/toolcall parameters (#140)`**
+
+- Fixes missing `context` and tool call parameters in certain code paths (see #139).
+
+**`fix unreliable tests (#128)`**
+
+- Random weight model and tokenizer made deterministic in tests; fixes flaky test failures (#119).
+
+### Embedding Model Improvements
+
+**`Add model-defined pooling fallback for embedding models (#156)`**
+
+- Adds a model-defined pooling fallback for embedding models.
+- Uses `takeAlong` for last-token pooling (avoids shape issues from `take`).
 
 ---
 
-## tag-20260315 (2026-03-15)
+## iOS-Specific Impact
 
-### Changes from tag-20260309 to tag-20260315
-
-**New: GLM-OCR Vision-Language Model Support**
-A full GLM-OCR model implementation (`GlmOcr.swift`, ~1262 lines) was added to the MLXVLM library. GLM-OCR is a vision-language model optimized for OCR and document understanding tasks. It is registered in `VLMModelFactory` and available for on-device inference on iPhone/iPad with Apple Silicon.
-
-**Enhancement: Expanded Sampling Parameters in GenerateParameters**
-`GenerateParameters` gained five new sampling controls:
-- `topK` (Int, default 0): Top-K filtering — keeps only the K most likely next tokens before sampling.
-- `minP` (Float, default 0.0): Min-P filtering — removes tokens whose probability falls below `minP * max_prob`.
-- `presencePenalty` / `presenceContextSize`: Additive penalty for any token that has appeared in the recent context window, discouraging repetition of topics.
-- `frequencyPenalty` / `frequencyContextSize`: Additive penalty that scales with how many times a token has appeared in the recent context, suppressing high-frequency tokens.
-
-`TopPSampler` was updated to accept and apply all three probability filters (topP, topK, minP) in combination. `processor()` now returns a unified `PenaltyProcessor` that combines repetition, presence, and frequency contexts when any are active.
-
-**Fix: Tool Calling for Qwen3.5**
-Qwen3.5 tool calling was broken. This update adds:
-- Prefix matching for flexible/incremental parsing of tool-call syntax
-- A pythonic tool converter (aligned with Qwen3.5 chat template expectations)
-- VLM-level detection for Qwen3.5 tool-call output
-- Nemotron model support added alongside the Qwen3.5 changes
-
-**Fix: Tool Calling for Mistral 3**
-Full tool-calling support was added for Mistral 3, including integration tests to validate the end-to-end flow.
-
-**Fix: LFM2.5 VL Tools**
-LFM2.5 VL's chat template was not receiving the tools list from the generation request, so tool calls were never triggered. The tool list is now correctly passed through.
+| Change | Impact |
+|--------|--------|
+| GPU sync elimination in penalty processors | Direct speed improvement on all Apple Silicon devices |
+| TopPSampler argPartition optimization | Reduces CPU/GPU work for large vocabulary models |
+| KV cache persistence API | Enables faster session restore for document-heavy use cases |
+| Multiple tool call fix | Required for reliable agentic/tool-use workflows |
+| mlx-swift bumped to 0.31.1 | Package dependency update — requires testing |
 
 ---
 
-### Risk Assessment
+## Risk Assessment
 
-| Change | Risk Level | Rationale |
-|--------|-----------|-----------|
-| GLM-OCR new model | Low | Additive only; no changes to existing model paths; new Swift file behind factory registration |
-| GenerateParameters expansion | Low-Medium | Additive API: all new params have safe defaults (0 / nil = disabled). Existing callers unaffected. The `processor()` function was refactored to return a new `PenaltyProcessor` type — callers that pattern-match on `RepetitionContext` specifically may break. |
-| `TopPSampler` signature change | Low-Medium | New optional parameters with defaults; existing `TopPSampler(temperature:topP:)` calls still compile. The sampler activation logic changed: topK or minP alone now triggers `TopPSampler` even when topP==1.0 (previously only `CategoricalSampler` was used). |
-| Qwen3.5 tool calling fix | Low | Bug fix; only activates for Qwen3.5-detected models; other models unaffected |
-| Mistral 3 tool calling | Low | New capability for an existing model family; no regressions expected |
-| LFM2.5 VL tools fix | Low | Single-line bug fix in template context passing |
+**Overall Risk: MODERATE**
 
-**Overall Upgrade Risk: Low**
-All changes are either purely additive or targeted bug fixes. No breaking API changes affect our current usage. The primary integration point is `GenerateParameters`, and since our app constructs it with named parameters, the new fields (all defaulted) are invisible to existing call sites. Recommend testing Qwen3.5 and Mistral 3 tool-calling flows after upgrade.
+| Area | Risk | Reason |
+|------|------|--------|
+| `KVCache` protocol + `copy()` | Low-Medium | Additive protocol requirement; only custom `KVCache` implementations outside the library would break |
+| `ChatSession` new initializers | Low | Additive API; existing call sites unaffected |
+| Penalty processor rewrite | Low-Medium | Significant algorithmic change in hot path; output distribution should be equivalent but sampling behavior could differ subtly in edge cases |
+| `TopPSampler` refactor | Low | Mirrors Python reference implementation; output should be equivalent |
+| mlx-swift 0.31.1 bump | Medium | Transitive dependency update; verify no conflicts with other mlx-swift consumers in the project |
+| Multi-tool-call fix | Low | Pure bug fix; only improves correctness |
+
+**Recommended:** Run existing generation and tool-use tests before shipping. Verify mlx-swift 0.31.1 resolves without conflicts in `Package.resolved`.
