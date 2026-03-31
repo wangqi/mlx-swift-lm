@@ -8,6 +8,10 @@
 import Foundation
 import MLX
 import MLXNN
+import OSLog
+
+// wangqi modified 2026-03-31: logger for RoPE fallback warnings
+private let ropeLogger = Logger(subsystem: "mlx-swift-lm", category: "RoPEUtils")
 
 public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
@@ -26,8 +30,14 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.traditional = traditional
 
+        // Fall back to unscaled RoPE instead of crashing when scaling_config is absent.
+        // wangqi modified 2026-03-31
         guard let scalingConfig = scalingConfig else {
-            fatalError("Llama3RoPE requires scaling_config")
+            ropeLogger.warning("Llama3RoPE: scaling_config missing, falling back to unscaled RoPE")
+            let indices = MLXArray(stride(from: 0, to: dims, by: 2))
+            self._freqs = MLX.pow(base, indices / Float(dims))
+            super.init()
+            return
         }
 
         let factor = scalingConfig["factor"]?.asFloat() ?? 1.0
@@ -261,17 +271,16 @@ public func initializeRope(
             mscaleAllDim: mscaleAllDim
         )
     } else if ropeType == "longrope" {
-        guard let config = scalingConfig else {
-            fatalError("longrope requires scaling_config")
-        }
-        guard let origMax = config["original_max_position_embeddings"]?.asInt() else {
-            fatalError("longrope requires original_max_position_embeddings")
-        }
-        guard let shortFactor = config["short_factor"]?.asFloats() else {
-            fatalError("longrope requires short_factor")
-        }
-        guard let longFactor = config["long_factor"]?.asFloats() else {
-            fatalError("longrope requires long_factor")
+        // Fall back to default RoPE when longrope config fields are missing.
+        // wangqi modified 2026-03-31
+        guard let config = scalingConfig,
+              let origMax = config["original_max_position_embeddings"]?.asInt(),
+              let shortFactor = config["short_factor"]?.asFloats(),
+              let longFactor = config["long_factor"]?.asFloats()
+        else {
+            ropeLogger.warning(
+                "longrope: missing required scaling_config fields, falling back to default RoPE")
+            return RoPE(dimensions: dims, traditional: traditional, base: base, scale: 1.0)
         }
 
         return SuScaledRoPE(
@@ -296,6 +305,9 @@ public func initializeRope(
         }
         return RoPE(dimensions: dims, traditional: traditional, base: base, scale: 1.0)
     } else {
-        fatalError("Unsupported RoPE type: \(ropeType)")
+        // Unknown RoPE type — fall back to default instead of crashing.
+        // wangqi modified 2026-03-31
+        ropeLogger.warning("Unsupported RoPE type '\(ropeType)', falling back to default RoPE")
+        return RoPE(dimensions: dims, traditional: traditional, base: base, scale: 1.0)
     }
 }

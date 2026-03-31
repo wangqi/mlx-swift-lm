@@ -8,6 +8,10 @@
 import Foundation
 import MLX
 import MLXNN
+import OSLog
+
+// wangqi modified 2026-03-31: logger for GatedDelta fallback warnings
+private let gatedDeltaLogger = Logger(subsystem: "mlx-swift-lm", category: "GatedDelta")
 
 // MARK: - Compute G
 
@@ -185,7 +189,10 @@ private func gatedDeltaStepOps(
     } else if g.ndim == 3 {
         decay = expandedDimensions(g, axis: -2)
     } else {
-        fatalError("Unsupported gating shape \(g.shape)")
+        // Log and fall back to a no-op expansion rather than crashing.
+        // wangqi modified 2026-03-31
+        gatedDeltaLogger.warning("Unsupported gating shape \(g.shape), falling back to dims [2,3]")
+        decay = expandedDimensions(g, axes: [2, 3])
     }
 
     var state = state * decay
@@ -203,7 +210,10 @@ private func gatedDeltaStepOps(
         } else if mask.ndim == 3 {
             expandedMask = expandedDimensions(mask, axis: -1)
         } else {
-            fatalError("Unsupported mask shape \(mask.shape)")
+            // Log and pass mask through rather than crashing; MLX will handle shape errors.
+            // wangqi modified 2026-03-31
+            gatedDeltaLogger.warning("Unsupported mask shape \(mask.shape), passing through")
+            expandedMask = mask
         }
         state = MLX.where(expandedMask, state, oldState)
     }

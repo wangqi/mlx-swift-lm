@@ -6,6 +6,27 @@ import MLX
 import MLXNN
 import Tokenizers
 
+// Thrown when a model uses a quantization bit-depth not supported by the current MLX version.
+// wangqi modified 2026-03-31
+struct QuantizationBitsError: LocalizedError {
+    let bits: Int
+    var errorDescription: String? {
+        "[quantize] The requested number of bits \(bits) is not supported. The supported bits are 2, 3, 4, 5, 6 and 8."
+    }
+}
+
+// Thrown when the model directory cannot be enumerated (missing, deleted, or permission denied).
+// wangqi modified 2026-03-31
+enum ModelLoadError: LocalizedError {
+    case directoryNotAccessible(URL)
+    var errorDescription: String? {
+        switch self {
+        case .directoryNotAccessible(let url):
+            return "Model directory is not accessible: \(url.path)"
+        }
+    }
+}
+
 /// Download the model using the `HubApi`.
 ///
 /// This will download `*.safetensors` and `*.json` if the ``ModelConfiguration``
@@ -70,8 +91,13 @@ public func loadWeights(
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
-    let enumerator = FileManager.default.enumerator(
-        at: modelDirectory, includingPropertiesForKeys: nil)!
+    // Guard against nil enumerator (missing or inaccessible model directory).
+    // wangqi modified 2026-03-31
+    guard let enumerator = FileManager.default.enumerator(
+        at: modelDirectory, includingPropertiesForKeys: nil)
+    else {
+        throw ModelLoadError.directoryNotAccessible(modelDirectory)
+    }
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
             let (w, m) = try loadArraysAndMetadata(url: url)
@@ -89,6 +115,20 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
+        // Validate bits before quantizing to avoid a fatal error from the MLX C++ layer.
+        // Supported bits are 2, 3, 4, 5, 6 and 8.
+        // wangqi modified 2026-03-31
+        let supportedBits: Set<Int> = [2, 3, 4, 5, 6, 8]
+        var bitsToCheck: [Int] = []
+        if let q = quantization { bitsToCheck.append(q.bits) }
+        if let plq = perLayerQuantization {
+            if let defaultQ = plq.quantization { bitsToCheck.append(defaultQ.bits) }
+            for case .quantize(let q) in plq.perLayerQuantization.values { bitsToCheck.append(q.bits) }
+        }
+        if let unsupportedBits = bitsToCheck.first(where: { !supportedBits.contains($0) }) {
+            throw QuantizationBitsError(bits: unsupportedBits)
+        }
+
         quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
                 if let perLayerQuantization {
