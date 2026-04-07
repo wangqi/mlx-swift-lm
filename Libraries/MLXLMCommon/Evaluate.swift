@@ -334,8 +334,10 @@ struct TokenRing {
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
+        // Flatten prompt to 1D -- VLM models produce [1, N] shaped tokens
+        // wangqi modified 2026-04-05
+        let promptTokens = prompt.reshaped(-1).asType(.int32)
+        let n = promptTokens.dim(0)
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
