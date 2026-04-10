@@ -19,11 +19,20 @@ public final class MLXLogCollector: @unchecked Sendable {
         set { lock.lock(); defer { lock.unlock() }; _logHandler = newValue }
     }
 
-    /// Emit a log message to the registered handler.
-    public func log(_ message: String) {
+    /// Fast check: whether a handler is installed. Zero-cost fast path — skips log call when disabled.
+    // wangqi modified 2026-04-08
+    public var hasHandler: Bool {
+        lock.lock(); defer { lock.unlock() }; return _logHandler != nil
+    }
+
+    /// Emit a log message. Zero-cost when no handler is installed:
+    /// string interpolation is never evaluated, lock → check nil → unlock → return.
+    // wangqi modified 2026-04-08
+    public func log(_ message: @autoclosure () -> String) {
         lock.lock()
         let handler = _logHandler
         lock.unlock()
-        handler?(message)
+        guard let handler else { return }
+        handler(message())
     }
 }
