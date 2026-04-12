@@ -80,7 +80,7 @@ public enum Chat {
 }
 
 /// Protocol for something that can convert structured
-/// ``Chat.Message`` into model specific ``Message``
+/// ``Chat/Message`` into model specific ``Message``
 /// (raw dictionary) format.
 ///
 /// Typically this is owned and used by a ``UserInputProcessor``:

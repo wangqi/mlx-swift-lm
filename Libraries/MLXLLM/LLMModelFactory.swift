@@ -16,7 +16,7 @@ private func create<C: Codable, M>(
 
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
-/// Typically called via ``LLMModelFactory/load(from:configuration:progressHandler:)``.
+/// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
 public enum LLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -520,7 +520,8 @@ public final class LLMModelFactory: ModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+                from: baseConfig.modelType, configData: configData)
         }
 
         // Load tokenizer and weights in parallel
