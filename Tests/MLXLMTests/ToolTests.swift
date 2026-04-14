@@ -466,6 +466,99 @@ struct ToolTests {
         #expect(toolCall.function.arguments["expression"] == .string("2+2"))
     }
 
+    // MARK: - Gemma 4 Format Tests
+
+    @Test("Test Gemma4 Function Parser - Basic")
+    func testGemma4ParserBasic() throws {
+        let parser = Gemma4FunctionParser()
+        let content = "<|tool_call>call:get_date{offset:0}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_date")
+        // JSONSerialization without .allowFragments does not parse top-level primitives,
+        // so bare numeric values fall back to string storage (same as GemmaFunctionParser)
+        #expect(toolCall.function.arguments["offset"] == .string("0"))
+    }
+
+    @Test("Test Gemma4 Function Parser - Escaped String Args")
+    func testGemma4ParserEscapedStrings() throws {
+        let parser = Gemma4FunctionParser()
+        // Gemma 4 uses <|"|> as the string delimiter (not <escape>)
+        let content = "<|tool_call>call:search{query:<|\"|>hello, world!<|\"|>}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
+    }
+
+    @Test("Test Gemma4 Function Parser - Multiple Args")
+    func testGemma4ParserMultipleArgs() throws {
+        let parser = Gemma4FunctionParser()
+        let content = "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>,unit:celsius}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Gemma4 Format via ToolCallProcessor")
+    func testGemma4FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .gemma4)
+        let content = "<|tool_call>call:get_date{offset:0}<tool_call|>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_date")
+    }
+
+    @Test("Test Gemma4 Function Parser - Double-brace JSON (chat template re-injection)")
+    func testGemma4ParserDoubleBraceJSON() throws {
+        // When the Gemma 4 Jinja template re-injects tool calls from history it wraps the
+        // JSON arguments string in an extra {} pair, producing double braces on the next turn.
+        // Example: call:get_date{{"offset":"0"}} instead of call:get_date{offset:0}
+        let parser = Gemma4FunctionParser()
+        let content = "<|tool_call>call:get_date{{\"offset\":\"0\"}}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_date")
+        #expect(toolCall.function.arguments["offset"] == .string("0"))
+    }
+
+    @Test("Test Gemma4 Function Parser - Single-brace JSON (plain JSON args)")
+    func testGemma4ParserSingleBraceJSON() throws {
+        // Some Gemma 4 chat template variants may produce single-brace JSON arguments.
+        let parser = Gemma4FunctionParser()
+        let content = "<|tool_call>call:get_weather{\"location\":\"Paris\",\"unit\":\"celsius\"}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test ToolCallFormat Inference - Gemma4 type maps to gemma4")
+    func testToolCallFormatInferenceGemma4() throws {
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "GEMMA4") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma4)
+    }
+
+    @Test("Test ToolCallFormat Inference - Gemma 1-3 still maps to gemma")
+    func testToolCallFormatInferenceGemma123() throws {
+        #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
+        #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma2") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma3") == .gemma)
+    }
+
     // MARK: - Kimi K2 Format Tests
 
     @Test("Test Kimi K2 Tool Call Parser")
@@ -599,6 +692,7 @@ struct ToolTests {
         #expect(ToolCallFormat.xmlFunction.rawValue == "xml_function")
         #expect(ToolCallFormat.glm4.rawValue == "glm4")
         #expect(ToolCallFormat.gemma.rawValue == "gemma")
+        #expect(ToolCallFormat.gemma4.rawValue == "gemma4")
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
         #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
         #expect(ToolCallFormat.mistral.rawValue == "mistral")

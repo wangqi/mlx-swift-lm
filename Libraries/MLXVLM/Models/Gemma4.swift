@@ -1804,18 +1804,63 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        var messages = Qwen2VLMessageGenerator().generate(from: input)
+
+        // Gemma 4's chat template requires tool calls and tool responses to live in the SAME
+        // assistant message (not separate role:"tool" messages). When a message has
+        // `tool_responses` set AND `content` is empty (falsy), the template skips <turn|>,
+        // leaving the model turn open so the model continues generating after <tool_response|>.
+        // Merge consecutive role:"assistant" + role:"tool" pairs accordingly.
+        // wangqi modified 2026-04-13
+        var mergedMessages: [[String: any Sendable]] = []
+        var idx = 0
+        while idx < messages.count {
+            let msg = messages[idx]
+            guard (msg["role"] as? String) == "assistant",
+                  idx + 1 < messages.count,
+                  (messages[idx + 1]["role"] as? String) == "tool" else {
+                mergedMessages.append(msg)
+                idx += 1
+                continue
+            }
+            var merged = msg
+            var toolResponses: [[String: any Sendable]] = []
+            idx += 1
+            while idx < messages.count, (messages[idx]["role"] as? String) == "tool" {
+                let toolMsg = messages[idx]
+                let toolName = (toolMsg["name"] as? String) ?? "unknown"
+                let toolContent: String
+                if let contentArray = toolMsg["content"] as? [[String: String]],
+                   let firstText = contentArray.first?["text"] {
+                    toolContent = firstText
+                } else if let contentStr = toolMsg["content"] as? String {
+                    toolContent = contentStr
+                } else {
+                    toolContent = ""
+                }
+                toolResponses.append(["name": toolName, "response": toolContent])
+                idx += 1
+            }
+            merged["tool_responses"] = toolResponses
+            // Empty string is falsy in Jinja — triggers the template's <turn|>-skip logic.
+            merged["content"] = ""
+            mergedMessages.append(merged)
+        }
+        messages = mergedMessages
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
 
+        // Debug: log decoded prompt so we can inspect what the chat template produces.
+        // wangqi modified 2026-04-13
+        if MLXLogCollector.shared.hasHandler {
+            let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+            MLXLogCollector.shared.log("[Gemma4Processor] prompt (\(promptTokens.count) tokens):\n\(decoded)\n---")
+        }
+
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let imagePlaceholderCount = promptTokens.filter { $0 == config.imageTokenId }.count
-            let boiCount = promptTokens.filter { $0 == config.boiTokenId }.count
-            let eoiCount = promptTokens.filter { $0 == config.eoiTokenId }.count
-
             let imagePixelsAndFrames = try input.images.map {
                 try preprocess(images: [$0.asCIImage()], processing: input.processing)
             }
