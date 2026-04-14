@@ -45,20 +45,97 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         } else {
             // Fallback for without-brackets case: use string indices to find the
             // outermost parentheses, avoiding the greedy/non-greedy regex pitfall.
-            guard let openParen = text.firstIndex(of: "("),
-                let closeParen = text.lastIndex(of: ")")
-            else { return nil }
+            if let openParen = text.firstIndex(of: "("),
+               let closeParen = text.lastIndex(of: ")")
+            {
+                let name = text[text.startIndex ..< openParen]
+                if !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
+                    funcName = String(name)
+                    argsString = String(text[text.index(after: openParen) ..< closeParen])
+                    let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+                    return ToolCall(function: .init(name: funcName, arguments: arguments))
+                }
+            }
 
-            let name = text[text.startIndex ..< openParen]
-            guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" })
-            else { return nil }
+            // wangqi modified 2026-04-13
+            // JSON fallback: LFM2.5-VL may output JSON-format tool calls inside the standard
+            // LFM2 tags, e.g. {"name":"get_date","parameters":{"offset":10},"type":"function"}.
+            // Try parsing the trimmed text as JSON and extract name + arguments.
+            if let toolCall = parseJSONFormat(text, tools: tools) {
+                return toolCall
+            }
 
-            funcName = String(name)
-            argsString = String(text[text.index(after: openParen) ..< closeParen])
+            MLXLogCollector.shared.log("[PythonicToolCallParser] parse failed — not Pythonic or JSON. content=\(text.prefix(200))")
+            return nil
         }
 
         let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+        MLXLogCollector.shared.log("[PythonicToolCallParser] parsed Pythonic: \(funcName)(\(argsString.prefix(120)))")
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    // wangqi modified 2026-04-13
+    /// Parse JSON-format tool call: {"name":"func","parameters":{...}} or {"name":"func","arguments":{...}}.
+    /// Also handles array format: [{"name":"func","arguments":{...}}] (LFM2.5-VL output style).
+    /// Used as a fallback when the Pythonic [func(arg=val)] pattern does not match.
+    private func parseJSONFormat(_ text: String, tools: [[String: any Sendable]]?) -> ToolCall? {
+        guard let data = text.data(using: .utf8),
+              let jsonObj = try? JSONSerialization.jsonObject(with: data)
+        else { return nil }
+
+        // Support both single-object {"name":...} and array [{"name":...}] formats.
+        // LFM2.5-VL outputs the array form inside <|tool_call_start|>...<|tool_call_end|>.
+        let json: [String: Any]
+        if let dict = jsonObj as? [String: Any] {
+            json = dict
+        } else if let array = jsonObj as? [[String: Any]], let first = array.first {
+            json = first
+        } else {
+            return nil
+        }
+
+        guard let name = json["name"] as? String, !name.isEmpty else { return nil }
+
+        // Extract argument values.
+        // Prefer "parameters" when it contains actual key=value pairs (not a JSON schema).
+        // A JSON schema has a top-level "properties" key with type == "object"; in that case
+        // the model echoed the tool definition instead of providing values, so fall back to
+        // "arguments" or an empty dict.
+        let arguments: [String: any Sendable]
+        let isSchema = { (d: [String: Any]) -> Bool in
+            d["properties"] != nil && (d["type"] as? String) == "object"
+        }
+        if let params = json["parameters"] as? [String: Any], !isSchema(params) {
+            arguments = convertJSONArgs(params, funcName: name, tools: tools)
+            MLXLogCollector.shared.log("[PythonicToolCallParser] JSON fallback: \(name) args=\(params)")
+        } else if let args = json["arguments"] as? [String: Any] {
+            arguments = convertJSONArgs(args, funcName: name, tools: tools)
+            MLXLogCollector.shared.log("[PythonicToolCallParser] JSON fallback (arguments key): \(name) args=\(args)")
+        } else {
+            arguments = [:]
+            MLXLogCollector.shared.log("[PythonicToolCallParser] JSON fallback: \(name) — parameters is schema or missing, calling with empty args")
+        }
+
+        return ToolCall(function: .init(name: name, arguments: arguments))
+    }
+
+    // wangqi modified 2026-04-13
+    /// Convert a raw JSON args dict (Any values) to typed [String: any Sendable] for ToolCall.
+    private func convertJSONArgs(
+        _ raw: [String: Any], funcName: String, tools: [[String: any Sendable]]?
+    ) -> [String: any Sendable] {
+        var result: [String: any Sendable] = [:]
+        for (key, value) in raw {
+            switch value {
+            case let s as String:
+                result[key] = convertParameterValue(s, paramName: key, funcName: funcName, tools: tools)
+            case let i as Int:    result[key] = i
+            case let d as Double: result[key] = d
+            case let b as Bool:   result[key] = b
+            default:              result[key] = String(describing: value)
+            }
+        }
+        return result
     }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {

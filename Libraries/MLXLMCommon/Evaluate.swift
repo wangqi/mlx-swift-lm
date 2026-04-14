@@ -2012,6 +2012,13 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
+        // wangqi modified 2026-04-13: flush any text buffered in pendingOutput before EOS parsing.
+        // In normal (non-tool-call) generations, pendingOutput may hold the last few tokens that
+        // arrived without a newline and were not yet flushed by processTaggedChunk.
+        if let text = toolCallProcessor.flushPendingOutput() {
+            _ = emit(.chunk(text))
+        }
+
         toolCallProcessor.processEOS()
 
         for toolCall in toolCallProcessor.toolCalls {

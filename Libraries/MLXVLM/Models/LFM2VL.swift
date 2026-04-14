@@ -746,11 +746,96 @@ public struct LFM2VLProcessor: UserInputProcessor {
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen2VLMessageGenerator().generate(from: input)
 
+        // wangqi modified 2026-04-13
+        // LFM2.5-VL's chat template serialises tools via `tools | tojson` and expects a flat
+        // schema: {"name":"func","description":"...","parameters":{...},"type":"function"}.
+        // The app sends OpenAI nested format {"type":"function","function":{...}}, which
+        // confuses the model and causes it to echo the tool definition instead of calling it.
+        let flatTools: [[String: any Sendable]]? = input.tools?.compactMap { tool in
+            if let function = tool["function"] as? [String: any Sendable],
+               let name = function["name"] as? String {
+                var flat: [String: any Sendable] = ["name": name, "type": "function"]
+                if let desc = function["description"] as? String { flat["description"] = desc }
+                if let params = function["parameters"] { flat["parameters"] = params }
+                return flat
+            }
+            return tool   // already flat or unknown shape — pass through unchanged
+        }
+
+        // wangqi modified 2026-04-13
+        // The chat template's render_tool_calls macro iterates `tool_call.function.arguments`
+        // with `.items()`, expecting a dict.  The app stores arguments as a JSON string
+        // (e.g. '{"offset":10}'), which Jinja cannot iterate — multi-turn tool history
+        // would render with no argument values.  Parse the JSON string into a dict here.
+        let fixedMessages: [[String: any Sendable]] = messages.map { msg in
+            guard (msg["role"] as? String) == "assistant",
+                  let rawCalls = msg["tool_calls"] as? [[String: any Sendable]] else {
+                return msg
+            }
+            let fixedCalls: [[String: any Sendable]] = rawCalls.map { call in
+                guard var fn = call["function"] as? [String: any Sendable],
+                      let argsString = fn["arguments"] as? String,
+                      let data = argsString.data(using: .utf8),
+                      let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                else { return call }
+                // wangqi modified 2026-04-13
+                // JSONSerialization returns [String: Any]; Any doesn't conform to Sendable.
+                // Convert each value to its Swift primitive via the helper below.
+                fn["arguments"] = jsonDictToSendable(dict)
+                var fixed = call
+                fixed["function"] = fn
+                return fixed
+            }
+            var fixedMsg = msg
+            fixedMsg["tool_calls"] = fixedCalls
+            return fixedMsg
+        }
+
+        // wangqi modified 2026-04-13
+        // Qwen2VLMessageGenerator wraps ALL roles' content as VLM arrays [{type:text, text:...}].
+        // The chat template's parse_content() macro should handle this, but swift-jinja cannot
+        // evaluate `item.type == "image"` / `item.text` on Swift dicts — it falls through to
+        // `item | tojson`, rendering "[{text: You are…, type: text}]" instead of plain text.
+        // Fix: unwrap system message content from the VLM array to a plain string before
+        // passing to applyChatTemplate, so parse_content() sees a simple string and returns it.
+        //
+        // When tools are present, also append the tool call format instruction to the system
+        // message. The LFM2.5-VL chat template only injects "List of tools: [...]" with no
+        // guidance on how to format a call. Without this, the model explains the tool in prose
+        // instead of outputting <|tool_call_start|>[func(arg=val)]<|tool_call_end|>.
+        let hasTools = flatTools.map { !$0.isEmpty } ?? false
+        let normalizedMessages: [[String: any Sendable]] = fixedMessages.map { msg in
+            guard (msg["role"] as? String) == "system",
+                  let contentArray = msg["content"] as? [[String: any Sendable]]
+            else { return msg }
+            var plainText = contentArray
+                .compactMap { $0["text"] as? String }
+                .joined(separator: "\n")
+            if hasTools {
+                let sep = plainText.isEmpty ? "" : "\n"
+                plainText += sep + "When calling a tool, respond with ONLY:\n<|tool_call_start|>[func_name(arg=value)]<|tool_call_end|>"
+            }
+            var normalized = msg
+            normalized["content"] = plainText
+            return normalized
+        }
+
+        if MLXLogCollector.shared.hasHandler, let t = flatTools, !t.isEmpty {
+            let toolNames = t.compactMap { $0["name"] as? String }.joined(separator: ", ")
+            MLXLogCollector.shared.log("[LFM2VLProcessor] \(t.count) flat tool(s): [\(toolNames)]")
+        }
         var promptTokens = try tokenizer.applyChatTemplate(
-            messages: messages,
-            tools: input.tools,
+            messages: normalizedMessages,
+            tools: flatTools,
             additionalContext: input.additionalContext
         )
+
+        // wangqi modified 2026-04-13
+        // Log the decoded prompt so we can inspect what the chat template produces.
+        if MLXLogCollector.shared.hasHandler {
+            let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
+            MLXLogCollector.shared.log("[LFM2VLProcessor] prompt (\(promptTokens.count) tokens):\n\(decoded)\n---")
+        }
 
         // Text-only input
         if input.images.isEmpty {
@@ -828,6 +913,28 @@ public struct LFM2VLProcessor: UserInputProcessor {
                 frames: frames
             )
         )
+    }
+
+    // wangqi modified 2026-04-13
+    /// Recursively converts a JSONSerialization result ([String: Any]) to [String: any Sendable].
+    /// JSONSerialization returns NSString, NSNumber, NSArray, NSDictionary; this converts
+    /// each to its Swift value type so the result can be stored in [String: any Sendable].
+    private func jsonDictToSendable(_ dict: [String: Any]) -> [String: any Sendable] {
+        dict.reduce(into: [String: any Sendable]()) { result, pair in
+            result[pair.key] = jsonValueToSendable(pair.value)
+        }
+    }
+
+    private func jsonValueToSendable(_ value: Any) -> any Sendable {
+        switch value {
+        case let s as String:        return s
+        case let b as Bool:          return b   // must precede Int (Bool is NSNumber in ObjC)
+        case let i as Int:           return i
+        case let d as Double:        return d
+        case let a as [Any]:         return a.map { jsonValueToSendable($0) }
+        case let d as [String: Any]: return jsonDictToSendable(d)
+        default:                     return String(describing: value)
+        }
     }
 }
 

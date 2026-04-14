@@ -34,6 +34,15 @@ public class ToolCallProcessor {
     private var state = State.normal
     private var toolCallBuffer = ""
 
+    // wangqi modified 2026-04-13
+    // Buffer for .normal-state output held back until we can confirm it is not a tool call.
+    // Flushed when a newline appears (safe — tool call JSON has no bare newlines), when the
+    // buffer exceeds the threshold (rules out being a short tool call), or at EOS.
+    // This lets us suppress the JSON emitted by models whose <|tool_call_start|> special token
+    // decodes to "" so the content arrives before <|tool_call_end|> without a visible start tag.
+    private var pendingOutput: String = ""
+    private let pendingOutputFlushThreshold = 512
+
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
 
@@ -103,6 +112,16 @@ public class ToolCallProcessor {
 
         toolCallBuffer = ""
         state = .normal
+    }
+
+    // wangqi modified 2026-04-13
+    /// Flush any text buffered in pendingOutput as regular (non-tool-call) content.
+    /// Call this at EOS so buffered normal text is not silently dropped.
+    public func flushPendingOutput() -> String? {
+        guard !pendingOutput.isEmpty else { return nil }
+        let flushed = pendingOutput
+        pendingOutput = ""
+        return flushed
     }
 
     // MARK: - Private Methods
@@ -184,8 +203,20 @@ public class ToolCallProcessor {
             return chunk
         }
 
-        guard (state == .normal && chunk.contains(startChar)) || state != .normal else {
-            return chunk
+        // wangqi modified 2026-04-13
+        // In .normal state with no start character: buffer instead of emitting immediately.
+        // This allows us to detect the invisible-start-tag pattern used by LFM2.5-VL, where
+        // <|tool_call_start|> decodes to "" and the JSON body arrives before <|tool_call_end|>.
+        // We flush on newline (safe — tool call JSON has no bare newlines) or when the buffer
+        // grows large enough to rule out being a short tool call prefix.
+        if state == .normal && !chunk.contains(startChar) {
+            pendingOutput += chunk
+            if pendingOutput.contains("\n") || pendingOutput.count >= pendingOutputFlushThreshold {
+                let flushed = pendingOutput
+                pendingOutput = ""
+                return flushed
+            }
+            return nil
         }
 
         toolCallBuffer += chunk
@@ -209,11 +240,33 @@ public class ToolCallProcessor {
                     return nil
                 }
             } else {
-                // Otherwise, return the collected text and reset the state
                 state = .normal
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
-                return (leadingToken ?? "") + buffer
+
+                // wangqi modified 2026-04-13
+                // If the failed buffer starts with the end tag, the model used an invisible start
+                // tag (e.g. <|tool_call_start|> decoded to ""). The JSON content accumulated in
+                // pendingOutput; try parsing it as a tool call and suppress output if it succeeds.
+                if let endTag = parser.endTag, buffer.hasPrefix(endTag), !pendingOutput.isEmpty {
+                    let content = pendingOutput
+                    pendingOutput = ""
+                    let trailing = String(buffer.dropFirst(endTag.count))
+                    if let toolCall = parser.parse(content: content, tools: tools)
+                        ?? fallbackParser?.parse(content: content, tools: tools) {
+                        toolCalls.append(toolCall)
+                        let result = (leadingToken ?? "") + trailing
+                        return result.isEmpty ? nil : result
+                    }
+                    // Parse failed — flush everything as plain text
+                    return (leadingToken ?? "") + content + buffer
+                }
+
+                // Normal match failure — flush any remaining pending output along with leading+buffer
+                let pending = pendingOutput
+                pendingOutput = ""
+                let result = (leadingToken ?? "") + pending + buffer
+                return result.isEmpty ? nil : result
             }
         case .collectingToolCall:
             guard let endTag = parser.endTag else {
