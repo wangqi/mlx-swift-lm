@@ -313,10 +313,24 @@ private class Gemma4Attention: Module {
             v = vNorm(v)
             v = v.transposed(0, 2, 1, 3)
 
+            // Fix: QuantizedKVCache.update() fatalErrors; use updateQuantized + dequantize instead
+            // wangqi modified 2026-04-19
             if let cache {
-                let (updatedK, updatedV) = cache.update(keys: k, values: v)
-                keys = updatedK
-                values = updatedV
+                if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+                    let (qk, qv) = quantizedCache.updateQuantized(keys: k, values: v)
+                    keys = dequantized(
+                        qk.0, scales: qk.1, biases: qk.2,
+                        groupSize: quantizedCache.groupSize, bits: quantizedCache.bits,
+                        mode: quantizedCache.mode)
+                    values = dequantized(
+                        qv.0, scales: qv.1, biases: qv.2,
+                        groupSize: quantizedCache.groupSize, bits: quantizedCache.bits,
+                        mode: quantizedCache.mode)
+                } else {
+                    let (updatedK, updatedV) = cache.update(keys: k, values: v)
+                    keys = updatedK
+                    values = updatedV
+                }
             } else {
                 keys = k
                 values = v
