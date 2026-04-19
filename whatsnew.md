@@ -1,117 +1,124 @@
-# mlx-swift-lm Upgrade Notes: tag-20260403 → tag-20260412
+# MLX Swift LM — What's New (tag-20260419)
 
-## Summary
-
-Four functional commits (7 PRs total) bringing speculative decoding for faster generation, a rebuilt Llama 3 tool-call pipeline with parallel call support, a critical Swift 6 Sendable fix for Release iOS builds, and a Pythonic tool-call parser rewrite using modern Swift Regex. No new model architectures. Our custom crash-guard patches (`QuantizationBitsError`, `ModelLoadError`) were preserved through the merge.
-
-Overall risk is **LOW**: no breaking API changes, all additions are opt-in or fix existing bugs.
+Upgrade window: **tag-20260412 → tag-20260419**  
+13 commits merged from upstream `ml-explore/mlx-swift-lm`.
 
 ---
 
-## Changes
+## New Features
 
-### 1. Speculative Decoding (#173)
+### Gemma 4 Text-Only Architecture (E2B and E4B) — #185
+Full port of `gemma4.py` / `gemma4_text.py` from mlx-lm. Enables on-device inference of Google Gemma 4's text-only variant on Apple Silicon via MLX.
 
-- New `SpeculativeTokenIterator` in `Evaluate.swift` implements the speculative decoding loop: a lightweight draft model proposes `numDraftTokens` (default: 2) tokens per round, which the main model verifies in a single batch pass. Accepted tokens are kept; rejected tokens cause the main model to regenerate from the rejection point.
-- New `generate()` overload added (our conflict resolution preserved it alongside the existing overloads):
-  ```swift
-  public func generate(
-      input: LMInput,
-      cache: [KVCache]? = nil,
-      parameters: GenerateParameters,
-      context: ModelContext,
-      draftModel: any LanguageModel,
-      draftCache: [KVCache]? = nil,
-      numDraftTokens: Int = 2,
-      wiredMemoryTicket: WiredMemoryTicket? = nil
-  ) throws -> AsyncStream<Generation>
-  ```
-- 84-line `SpeculativeDecodingTests.swift` added to verify correctness.
-- **iOS impact**: Requires two models in memory simultaneously — violates the app's mutual-exclusion memory policy (`willLoadTextModel()`). Feature is entirely opt-in; existing `generate()` calls are unaffected. Do not expose to users without first validating available RAM via `canLoadModel(fileSizeMB:)`.
+Key architectural additions:
+- **Per-Layer Embeddings (PLE)** with gated residual
+- **Shared KV cache** across later layers (reduces memory pressure)
+- **Dual RoPE**: proportional RoPE for full-attention layers, default RoPE for sliding-window layers
+- **ProportionalRoPE** with `partial_rotary_factor` support
+- **Global head dimensions** (512) for full-attention layers
+- **Double-wide MLP** for KV-shared layers
+- **Logit softcapping**
+- **LoRA adapter support**
+
+Registers `gemma4` and `gemma4_text` model types with E2B/E4B 4-bit configs. Fixes model IDs, weight key mapping, and EOS token (`<turn|>`, token ID 106).
+
+> **iOS impact**: E2B (~2 GB at 4-bit) is feasible on iPhone 15 Pro/16 series; E4B (~4 GB) needs 8 GB RAM (M-series iPads or iPhone 16 Pro Max).
 
 ---
 
-### 2. Llama 3 Tool Calling Rebuilt (#145)
-
-Llama 3 models emit tool calls in two different formats depending on model size and prompt: a JSON array `[{"name":...,"parameters":...}]` or a Pythonic array `[func1(), func2()]`. The previous implementation handled neither format correctly for parallel calls.
-
-- **New `Llama3ToolCallParser.swift`**: Parses both the `parameters` and `arguments` key variants in the JSON array, extracting multiple parallel tool calls in a single `parseEOS` pass.
-- **`ToolCallProcessor`**: `startTag` is now `<|python_tag|>`, ensuring the processor correctly buffers all tool output without leaking raw tags into the streaming UI.
-- **`ToolCallFormat`**: Extended with Llama 3 format detection, wired into `LLMModelFactory` for automatic selection.
-- **`PythonicToolCallParser`**: Refactored from `NSRegularExpression` to Swift 5.7+ `Regex` literals. Now extracts multiple sequential calls `[func1(), func2()]` via `parseEOS`.
-- Integration unit tests added covering both parsers.
-- **iOS impact**: Low risk. `NSRegularExpression` → Swift `Regex` requires iOS 16+; app targets iOS 18.6+. Llama 3 tool calls that previously produced garbled output or missed parallel calls will now work correctly.
+### Gemma 4 Batched RoPE Offsets — #212
+Adds `Gemma4PositionOffset` and a `BatchPositionedKVCache` stub in preparation for multi-image / multi-turn batching. The attention path now accepts per-batch positional offsets, enabling future speculative decoding and multi-image prompt caching for Gemma 4.
 
 ---
 
-### 3. Preserve JSONValue in Llama3ToolCallParser — Swift 6 Sendable Fix (#203)
+### Embedder API Unified with LLM/VLM Factory — #202
+`MLXEmbedders` module refactored to reuse the same `ModelFactory`, `ModelTypeRegistry`, `AbstractModelRegistry`, and loading/download pipeline as `MLXLLM`/`MLXVLM`.
 
-`Llama3ToolCallParser` was converting decoded `[String: JSONValue]` arguments through `Any` (via `.anyValue`) when constructing `ToolCall.Function`. This intermediate `Any` conversion violated Swift 6 `Sendable` rules, causing compilation failure in Release builds targeting iOS.
+**Removed files** (breaking for direct importers):
+- `BaseConfiguration.swift`
+- `Configuration.swift`
+- `Load.swift`
+- `Models.swift`
 
-- **Fix**: New `ToolCall.Function.init(name:arguments:[String:JSONValue])` overload added. The parser passes `JSONValue` directly, eliminating the `Any` round-trip.
-- **iOS impact**: **Critical.** Without this fix, any app using `Llama3ToolCallParser` fails to compile in Release mode under Swift 6. Merged as a standalone patch immediately after the Llama 3 tool-call commit.
+**New files**:
+- `EmbedderModelContainer.swift` — unified container matching `LLMModelContainer`
+- `ModelFactory.swift` — factory conforming to shared `AbstractModelFactory`
 
----
-
-### 4. IntegrationTesting Xcode Project (#142)
-
-- New `IntegrationTesting/IntegrationTesting.xcodeproj` with end-to-end tool-call tests for Mistral 3, Nemotron, and Qwen3.5.
-- Requires macOS with Metal; downloads models from HuggingFace Hub on first run.
-- `IntegrationTestHelpers` library expanded with 395 lines of model-specific helpers.
-- **iOS impact**: None — macOS-only test infrastructure.
-
----
-
-### 5. Doc Comments and CI Verification (#176)
-
-- Doc comments corrected across `Evaluate.swift`, `ChatSession.swift`, `LoRA+Layers.swift`, `ModelFactory.swift`, `UserInput.swift`, and others.
-- New `scripts/verify-docs.sh` runs in CI to catch doc regressions.
-- **iOS impact**: None. No logic changes.
+> **Migration**: Replace any direct `Load.swift` embedder calls with the new factory pattern.
 
 ---
 
-### 6. README Updates (#201, #204)
+## Bug Fixes
 
-- Anchor links fixed; integration documentation expanded.
-- **iOS impact**: None.
+### Gemma 4 System Message and Modality Order — #211
+Corrects two Gemma 4 VLM issues:
+1. System messages were not being passed correctly to the chat template.
+2. Content type ordering was wrong — images must precede text in the multimodal content array per Gemma 4's template.
 
----
-
-## iOS-Specific Impact
-
-| Change | Impact |
-|--------|--------|
-| Speculative decoding | Opt-in faster generation; requires two models in RAM simultaneously — use with care |
-| Llama 3 tool calling rebuilt | Parallel tool calls now work correctly for Llama 3 models on device |
-| Swift 6 Sendable fix | **Required** — fixes Release build failure for Llama 3 tool-call users |
-| PythonicToolCallParser Regex rewrite | Multi-call Pythonic tool output correctly extracted; no NSRegularExpression overhead |
-| ToolCallProcessor startTag fix | Streaming UI no longer leaks raw `<|python_tag|>` tokens |
+> **iOS impact**: Without this fix, Gemma 4 VLM responses would ignore system prompts and multi-modal prompts could produce garbled output.
 
 ---
 
-## Risk Assessment
+### KV Cache Prompt-Cache Round-Trip — #155
+Fixes `save`/`restore` support for `ArraysCache`, `MambaCache`, and `CacheList`. Previously these cache types silently no-op'd on restore (the NOP was replaced with `assertionFailure`), so prompt-cache acceleration had no effect for Mamba/SSM-hybrid models.
 
-**Overall Risk: LOW**
+176 new unit tests added in `KVCacheTests.swift` covering all cache variants.
 
-| Area | Risk | Reason |
-|------|------|--------|
-| Speculative decoding | Medium | Two-model RAM requirement; must remain opt-in on iOS |
-| Llama 3 tool call refactor | Low | Additive new parser; existing JSON/Pythonic paths preserved |
-| PythonicToolCallParser Regex rewrite | Low-Medium | Semantics equivalent; new integration tests provide confidence; Swift Regex edge cases possible on unusual inputs |
-| JSONValue Sendable fix | Low | Fixes compiler error; runtime behavior identical or better (no lossy Any conversion) |
-| ModelFactory / UserInput doc changes | Minimal | Doc and formatting only; no logic touched |
-| Our custom patches | No risk | `QuantizationBitsError` and `ModelLoadError` preserved through merge conflict resolution |
+> **iOS impact**: Prompt cache now actually works for Mamba and hybrid models, reducing TTFT on repeated/similar prompts.
 
 ---
 
-## Our Custom Patches (preserved across merge)
+### Qwen3 Next Tool Call Format — #166
+`ToolCallFormat.infer()` now recognises `qwen3_next` (and variants) as `xmlFunction` format. Previously tool calls from Qwen3-Next models were silently dropped because the model type was not matched.
 
-- `fallbackToolCallParser` parameter on `generate()` — bridges app-level parsers into the generate pipeline (wangqi modified 2026-03-10)
-- `QuantizationBitsError` — prevents fatal crash on unsupported quantization bit depths (e.g. 7-bit)
-- `ModelLoadError.directoryNotAccessible` — prevents crash when model directory is missing or deleted at load time
+> **iOS impact**: Qwen3 Next models (e.g. Qwen3-Next-4B) can now invoke tools correctly in agentic workflows.
 
 ---
 
-## Previous: tag-20260328 → tag-20260403
+### BERT Embedder Safety Guard for Long Inputs — #163
+BERT models crash with an out-of-bounds error when input token count exceeds `maxPositionEmbeddings` (the position embedding table is fixed-size). This is now guarded: inputs are truncated with a warning and the new `maxPositionEmbeddings` property is exposed on `EmbeddingModel` so callers can pre-check or chunk.
 
-Swift 6 strict concurrency, 10x–15x model-load speedup via swift-tokenizers, HuggingFace Hub decoupled to optional module, RoPE unified across 45 models.
+> **iOS impact**: Prevents hard crashes when embedding long documents or memory entries via BERT-family models.
+
+---
+
+## API / Infrastructure Changes
+
+### v3 API Small Fixes — #190
+- Jinja template files are now downloaded in all loading paths (previously missed in some routes, causing template evaluation failures).
+- HuggingFace macros (`MLXHuggingFace`) now emit fully qualified type names, fixing compilation in multi-module setups.
+
+### swift-syntax Dependency Tightened — #216
+Range changed from `from: "600.0.0-latest"` to `"600.0.0" ..< "604.0.0"` to prevent unintentional pulls of incompatible swift-syntax 604+ releases during `swift package update`.
+
+---
+
+## Documentation
+
+- **Upgrade guide** (`upgrade.md`): Step-by-step 2.x → 3.x migration.
+- **Using guide** (`using.md`): Integration package selection, quick-start code.
+- **Developing guide** (`developing.md`): How to contribute / port new model architectures.
+- Fallback source links added to README for SPI 404 cases.
+
+---
+
+## Upgrade Risk Assessment
+
+| Area | Risk | Notes |
+|------|------|-------|
+| `MLXEmbedders` API | **Medium** | Breaking refactor removes 4 files; update all embedder load callsites |
+| Gemma 4 VLM messages | **Low** | Correctness fix; regression only if code bypassed `Gemma4MessageGenerator` |
+| KV Cache save/restore | **Low** | Additive; new `assertionFailure` may surface previously silent bugs in tests |
+| Tool call format | **Low** | Additive; no existing call sites broken |
+| BERT input guard | **Low** | Truncation instead of crash; semantic output may differ for very long inputs |
+| swift-syntax constraint | **Low** | Build-time only; no runtime change |
+| Gemma 4 text models | **Low** | New model type; no impact on existing model loading |
+
+**Overall risk: Low-Medium.** The only breaking change is the `MLXEmbedders` API refactor. Verify all embedder call sites compile after merge.
+
+---
+
+## Local Fork Notes (wangqi)
+
+- `Libraries/MLXVLM/Models/Gemma4.swift`: Conflict resolved -- tool-call merging loop preserved on top of the new `Gemma4MessageGenerator()` (replaces the old `Qwen2VLMessageGenerator()` placeholder). The loop is still required because Gemma 4's Jinja template expects tool responses inside the same assistant message.
+- `Libraries/MLXLMCommon/Chat.swift`: `generate(messages:)` override with tool-field injection and debug logging retained (wangqi 2026-03-10).
