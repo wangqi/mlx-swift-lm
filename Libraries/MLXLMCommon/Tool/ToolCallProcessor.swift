@@ -211,7 +211,12 @@ public class ToolCallProcessor {
         // grows large enough to rule out being a short tool call prefix.
         if state == .normal && !chunk.contains(startChar) {
             pendingOutput += chunk
-            if pendingOutput.contains("\n") || pendingOutput.count >= pendingOutputFlushThreshold {
+            // Don't flush JSON-starting buffers on newline: models like Ternary-Bonsai emit
+            // JSON\n</tool_call> where the \n separates the JSON from the end tag, not a sign
+            // that the buffer isn't a tool call.
+            // wangqi modified 2026-04-19
+            let mightBeToolCall = pendingOutput.hasPrefix("{")
+            if (!mightBeToolCall && pendingOutput.contains("\n")) || pendingOutput.count >= pendingOutputFlushThreshold {
                 let flushed = pendingOutput
                 pendingOutput = ""
                 return flushed
