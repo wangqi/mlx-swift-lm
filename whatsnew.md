@@ -1,124 +1,84 @@
-# MLX Swift LM — What's New (tag-20260419)
+# mlx-swift-lm: tag-20260425 → tag-20260509
 
-Upgrade window: **tag-20260412 → tag-20260419**  
-13 commits merged from upstream `ml-explore/mlx-swift-lm`.
+## Summary
 
----
-
-## New Features
-
-### Gemma 4 Text-Only Architecture (E2B and E4B) — #185
-Full port of `gemma4.py` / `gemma4_text.py` from mlx-lm. Enables on-device inference of Google Gemma 4's text-only variant on Apple Silicon via MLX.
-
-Key architectural additions:
-- **Per-Layer Embeddings (PLE)** with gated residual
-- **Shared KV cache** across later layers (reduces memory pressure)
-- **Dual RoPE**: proportional RoPE for full-attention layers, default RoPE for sliding-window layers
-- **ProportionalRoPE** with `partial_rotary_factor` support
-- **Global head dimensions** (512) for full-attention layers
-- **Double-wide MLP** for KV-shared layers
-- **Logit softcapping**
-- **LoRA adapter support**
-
-Registers `gemma4` and `gemma4_text` model types with E2B/E4B 4-bit configs. Fixes model IDs, weight key mapping, and EOS token (`<turn|>`, token ID 106).
-
-> **iOS impact**: E2B (~2 GB at 4-bit) is feasible on iPhone 15 Pro/16 series; E4B (~4 GB) needs 8 GB RAM (M-series iPads or iPhone 16 Pro Max).
+Two commits merged from upstream `ml-explore/mlx-swift-lm` between April 25 and May 9, 2026. The update is a targeted bug-fix release paired with an expanded integration-test suite. No new model architectures, no API changes, no dependency version bumps.
 
 ---
 
-### Gemma 4 Batched RoPE Offsets — #212
-Adds `Gemma4PositionOffset` and a `BatchPositionedKVCache` stub in preparation for multi-image / multi-turn batching. The attention path now accepts per-batch positional offsets, enabling future speculative decoding and multi-image prompt caching for Gemma 4.
+## Changes
+
+### Bug Fix: Qwen3.5 VLM crash on text-only inference (PR #149)
+
+**Commit:** `3e2ddb4` — David Irvine, 2026-05-07
+
+**Problem:** `Qwen35Language.LanguageModel.callAsFunction` assumed its `inputs` tensor was always 2-D `[batch, seq]`. Text-only callers — `WiredMemoryUtils.tune` and `TokenIterator` — can legally pass a 1-D `[seq]` array. When that happened, `getRopeIndex()` and every subsequent `dim(1)` call crashed with a **SmallVector out-of-range** panic (issue #148).
+
+**Fix:** A one-line ndim guard is inserted at the top of `callAsFunction`:
+
+```swift
+let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+```
+
+This reshapes 1-D inputs to `[1, seq]` before any dimension-dependent logic runs. 2-D inputs are left unchanged.
+
+**File changed:** `Libraries/MLXVLM/Models/Qwen35.swift`
+
+**iOS Impact:** Positive — Qwen3.5 VLM models (e.g., `Qwen3.5-VL-2B-Instruct-4bit`) no longer crash when used in text-only mode. Previously, sending a plain text message to a Qwen3.5 VLM container could trigger this panic during `WiredMemoryUtils` wired-memory tuning or on the first token-iterator call.
 
 ---
 
-### Embedder API Unified with LLM/VLM Factory — #202
-`MLXEmbedders` module refactored to reuse the same `ModelFactory`, `ModelTypeRegistry`, `AbstractModelRegistry`, and loading/download pipeline as `MLXLLM`/`MLXVLM`.
+### Test Infrastructure: Coherence Integration Tests (PR #235)
 
-**Removed files** (breaking for direct importers):
-- `BaseConfiguration.swift`
-- `Configuration.swift`
-- `Load.swift`
-- `Models.swift`
+**Commit:** `38fff58` — Anthony DePasquale, 2026-05-08
 
-**New files**:
-- `EmbedderModelContainer.swift` — unified container matching `LLMModelContainer`
-- `ModelFactory.swift` — factory conforming to shared `AbstractModelFactory`
+**Added:** `IntegrationTesting/IntegrationTestingTests/CoherenceIntegrationTests.swift`
 
-> **Migration**: Replace any direct `Load.swift` embedder calls with the new factory pattern.
+A new `@Suite(.serialized)` test suite that runs a planet-naming coherence prompt against 18 model families to verify end-to-end generation correctness:
 
----
+| Model | Registry Key |
+|-------|-------------|
+| BitNet b1.58 2B | `LLMRegistry.bitnet_b1_58_2b_4t_4bit` |
+| EXAONE 4.0 1.2B | `LLMRegistry.exaone_4_0_1_2b_4bit` |
+| Gemma 3 1B QAT | `LLMRegistry.gemma3_1B_qat_4bit` |
+| Gemma 3n E2B | `LLMRegistry.gemma3n_E2B_it_lm_4bit` |
+| Gemma 4 E2B | `LLMRegistry.gemma4_e2b_it_4bit` |
+| GLM4 9B | `LLMRegistry.glm4_9b_4bit` |
+| Granite 3.3 2B | `LLMRegistry.granite3_3_2b_4bit` |
+| Granite 4.0-H Tiny | `LLMRegistry.granite_4_0_h_tiny_4bit_dwq` |
+| Jamba 3B | `LLMRegistry.jamba_3b_4bit` |
+| LFM2 1.2B | `LLMRegistry.lfm2_1_2b_4bit` |
+| Llama 3.2 1B | `LLMRegistry.llama3_2_1B_4bit` |
+| Mistral 7B | `LLMRegistry.mistral7B4bit` |
+| OLMo2 7B | `LLMRegistry.olmo_2_1124_7B_Instruct_4bit` |
+| OLMoE 1B×7B | `LLMRegistry.olmoe_1b_7b_0125_instruct_4bit` |
+| Phi 3.5 | `LLMRegistry.phi3_5_4bit` |
+| Qwen3 1.7B | `LLMRegistry.qwen3_1_7b_4bit` |
+| Qwen3.5 2B | `LLMRegistry.qwen3_5_2b_4bit` |
+| SmolLM3 3B | `LLMRegistry.smollm3_3b_4bit` |
 
-## Bug Fixes
+**Refactored:** `ToolCallIntegrationTests.swift` — model-specific container helper methods (`lfm2Container()`, `glm4Container()`, etc.) replaced with the unified `llmContainer(for:)` call, consolidating Task lifecycle management in one place.
 
-### Gemma 4 System Message and Modality Order — #211
-Corrects two Gemma 4 VLM issues:
-1. System messages were not being passed correctly to the chat template.
-2. Content type ordering was wrong — images must precede text in the multimodal content array per Gemma 4's template.
-
-> **iOS impact**: Without this fix, Gemma 4 VLM responses would ignore system prompts and multi-modal prompts could produce garbled output.
-
----
-
-### KV Cache Prompt-Cache Round-Trip — #155
-Fixes `save`/`restore` support for `ArraysCache`, `MambaCache`, and `CacheList`. Previously these cache types silently no-op'd on restore (the NOP was replaced with `assertionFailure`), so prompt-cache acceleration had no effect for Mamba/SSM-hybrid models.
-
-176 new unit tests added in `KVCacheTests.swift` covering all cache variants.
-
-> **iOS impact**: Prompt cache now actually works for Mamba and hybrid models, reducing TTFT on repeated/similar prompts.
+**iOS Impact:** None on production code. Test-only change that indirectly validates iOS-runnable model families.
 
 ---
 
-### Qwen3 Next Tool Call Format — #166
-`ToolCallFormat.infer()` now recognises `qwen3_next` (and variants) as `xmlFunction` format. Previously tool calls from Qwen3-Next models were silently dropped because the model type was not matched.
+## Risk Assessment
 
-> **iOS impact**: Qwen3 Next models (e.g. Qwen3-Next-4B) can now invoke tools correctly in agentic workflows.
+| Area | Risk | Rationale |
+|------|------|-----------|
+| Qwen3.5 VLM fix | **Low** | Single defensive guard at function entry; only affects previously-crashing code paths. 2D inputs pass through unchanged. |
+| Coherence test suite | **None** | Test-only code, not compiled into the app target. |
+| API surface | **None** | No public API changes. |
+| Other model families | **None** | Changes are isolated to `Qwen35.swift`; no shared infrastructure modified. |
+| Dependency versions | **None** | No package version bumps in this range. |
 
----
-
-### BERT Embedder Safety Guard for Long Inputs — #163
-BERT models crash with an out-of-bounds error when input token count exceeds `maxPositionEmbeddings` (the position embedding table is fixed-size). This is now guarded: inputs are truncated with a warning and the new `maxPositionEmbeddings` property is exposed on `EmbeddingModel` so callers can pre-check or chunk.
-
-> **iOS impact**: Prevents hard crashes when embedding long documents or memory entries via BERT-family models.
-
----
-
-## API / Infrastructure Changes
-
-### v3 API Small Fixes — #190
-- Jinja template files are now downloaded in all loading paths (previously missed in some routes, causing template evaluation failures).
-- HuggingFace macros (`MLXHuggingFace`) now emit fully qualified type names, fixing compilation in multi-module setups.
-
-### swift-syntax Dependency Tightened — #216
-Range changed from `from: "600.0.0-latest"` to `"600.0.0" ..< "604.0.0"` to prevent unintentional pulls of incompatible swift-syntax 604+ releases during `swift package update`.
+**Overall upgrade risk: LOW.** The only production change is a crash fix. Rolling back would re-expose the Qwen3.5 VLM text-only crash.
 
 ---
 
-## Documentation
+## Recommended Actions
 
-- **Upgrade guide** (`upgrade.md`): Step-by-step 2.x → 3.x migration.
-- **Using guide** (`using.md`): Integration package selection, quick-start code.
-- **Developing guide** (`developing.md`): How to contribute / port new model architectures.
-- Fallback source links added to README for SPI 404 cases.
-
----
-
-## Upgrade Risk Assessment
-
-| Area | Risk | Notes |
-|------|------|-------|
-| `MLXEmbedders` API | **Medium** | Breaking refactor removes 4 files; update all embedder load callsites |
-| Gemma 4 VLM messages | **Low** | Correctness fix; regression only if code bypassed `Gemma4MessageGenerator` |
-| KV Cache save/restore | **Low** | Additive; new `assertionFailure` may surface previously silent bugs in tests |
-| Tool call format | **Low** | Additive; no existing call sites broken |
-| BERT input guard | **Low** | Truncation instead of crash; semantic output may differ for very long inputs |
-| swift-syntax constraint | **Low** | Build-time only; no runtime change |
-| Gemma 4 text models | **Low** | New model type; no impact on existing model loading |
-
-**Overall risk: Low-Medium.** The only breaking change is the `MLXEmbedders` API refactor. Verify all embedder call sites compile after merge.
-
----
-
-## Local Fork Notes (wangqi)
-
-- `Libraries/MLXVLM/Models/Gemma4.swift`: Conflict resolved -- tool-call merging loop preserved on top of the new `Gemma4MessageGenerator()` (replaces the old `Qwen2VLMessageGenerator()` placeholder). The loop is still required because Gemma 4's Jinja template expects tool responses inside the same assistant message.
-- `Libraries/MLXLMCommon/Chat.swift`: `generate(messages:)` override with tool-field injection and debug logging retained (wangqi 2026-03-10).
+1. Run `ToolRunShellTests` and any local MLX model tests to confirm no regressions.
+2. Verify Qwen3.5 VL models load and respond to text-only prompts without crashing on device.
+3. No config, JSON, or localization changes required.
