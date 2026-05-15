@@ -30,7 +30,8 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let data = jsonStr.data(using: .utf8),
-            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
+            let normalizedData = normalizedToolCallData(from: data),
+            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: normalizedData)
         {
             return ToolCall(function: function)
         }
@@ -38,5 +39,23 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
         // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
         return XMLFunctionParser().parse(content: content, tools: tools)
+    }
+
+    private func normalizedToolCallData(from data: Data) -> Data? {
+        guard var jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+
+        if let stringifiedArguments = jsonObject["arguments"] as? String {
+            guard
+                let argumentsData = stringifiedArguments.data(using: .utf8),
+                let argumentsObject = try? JSONSerialization.jsonObject(with: argumentsData)
+                    as? [String: Any]
+            else { return nil }
+            jsonObject["arguments"] = argumentsObject
+        }
+
+        return try? JSONSerialization.data(withJSONObject: jsonObject)
     }
 }

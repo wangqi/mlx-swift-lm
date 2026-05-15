@@ -90,7 +90,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<InT>(state[i]);
+              o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
 
@@ -139,6 +139,7 @@ func gatedDeltaKernel(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
     let inputType = q.dtype
+    let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -157,6 +158,7 @@ func gatedDeltaKernel(
         inputs,
         template: [
             ("InT", inputType),
+            ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -165,7 +167,7 @@ func gatedDeltaKernel(
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
+        outputDTypes: [inputType, stateType]
     )
 
     return (outputs[0], outputs[1])
@@ -297,7 +299,12 @@ func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // State kept in fp32 to match Python mlx-lm. Using q.dtype (bf16) loses
+    // precision across T-step recurrence, compounding rounding error.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
 
     if GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
