@@ -1,84 +1,93 @@
-# mlx-swift-lm: tag-20260425 → tag-20260509
+# mlx-swift-lm: tag-20260425 → tag-20260515
 
 ## Summary
 
-Two commits merged from upstream `ml-explore/mlx-swift-lm` between April 25 and May 9, 2026. The update is a targeted bug-fix release paired with an expanded integration-test suite. No new model architectures, no API changes, no dependency version bumps.
+23 commits merged from upstream `ml-explore/mlx-swift-lm` (plus the local merge commit preserving our `fallbackToolCallParser` and XML fallback support). This release is primarily a **stability and performance release** — no major model additions, but several high-impact fixes for iOS devices and significant speedups for hybrid SSM / GDN model families.
 
 ---
 
-## Changes
+## New Features
 
-### Bug Fix: Qwen3.5 VLM crash on text-only inference (PR #149)
+### Speculative Decoding in ChatSession API (#181, #193)
+`ChatSession` now exposes speculative decoding via a draft-model parameter. A small draft model proposes token candidates that the main model verifies in batch, reducing wall time on generation-heavy workloads. This was previously only accessible at the lower `generate()` API level.
 
-**Commit:** `3e2ddb4` — David Irvine, 2026-05-07
+### ParoQuant (Pairwise Rotation Quantization) Support (#164)
+Added support for loading models quantized with ParoQuant — a quantization method that applies learned pairwise rotations before quantizing weights, improving accuracy at the same bit-width. Enables future `mlx-community` models with this quantization scheme.
 
-**Problem:** `Qwen35Language.LanguageModel.callAsFunction` assumed its `inputs` tensor was always 2-D `[batch, seq]`. Text-only callers — `WiredMemoryUtils.tune` and `TokenIterator` — can legally pass a 1-D `[seq]` array. When that happened, `getRopeIndex()` and every subsequent `dim(1)` call crashed with a **SmallVector out-of-range** panic (issue #148).
+### FusedGateUpSwitchGLU for MoE Models (#227)
+`FusedGateUpSwitchGLU` combines `gate_proj` and `up_proj` into a single fused matrix multiplication for Mixture-of-Experts models that use a switched GLU activation. This reduces memory bandwidth pressure on Apple Silicon — beneficial on all devices, especially the Neural Engine path on iPhone/iPad.
 
-**Fix:** A one-line ndim guard is inserted at the top of `callAsFunction`:
-
-```swift
-let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
-```
-
-This reshapes 1-D inputs to `[1, seq]` before any dimension-dependent logic runs. 2-D inputs are left unchanged.
-
-**File changed:** `Libraries/MLXVLM/Models/Qwen35.swift`
-
-**iOS Impact:** Positive — Qwen3.5 VLM models (e.g., `Qwen3.5-VL-2B-Instruct-4bit`) no longer crash when used in text-only mode. Previously, sending a plain text message to a Qwen3.5 VLM container could trigger this panic during `WiredMemoryUtils` wired-memory tuning or on the first token-iterator call.
+### Tool-Aware Processing in VLM Processors (#167, #172, #174)
+- `ToolCallProcessor` now receives the full tools schema for type-aware argument parsing, fixing silent type mismatches in structured output.
+- Tools and `additionalContext` are now forwarded into `GlmOcr` and `SmolVLM2` processors, enabling tool use within vision pipelines.
+- Stringified JSON tool call arguments (returned by some models as a JSON string instead of a parsed object) are now handled transparently.
 
 ---
 
-### Test Infrastructure: Coherence Integration Tests (PR #235)
+## Performance
 
-**Commit:** `38fff58` — Anthony DePasquale, 2026-05-08
+### 10× Faster Prefill on GDN Models — asyncEval Pipeline (#225)
+Prefill chunks for Gated Delta Network (GDN) / hybrid SSM models are now pipelined via `asyncEval`, overlapping computation and data transfer on Apple Silicon. Benchmarked at **10× faster prefill** on GDN models (e.g., Qwen3 hybrid, Falcon H1) compared to the sequential evaluation path. This is the single largest user-visible improvement in this release for iPhone/iPad users running SSM-family models.
 
-**Added:** `IntegrationTesting/IntegrationTestingTests/CoherenceIntegrationTests.swift`
+### GatedDelta fp32 State Precision (#224)
+The GatedDelta recurrence state is now kept in `float32` (matching Python `mlx-lm`) instead of `bfloat16`. Previously, state accumulated bf16 rounding error across each recurrence step, leading to ~0.25 max absolute difference vs the reference at T > 1. Post-fix, the Swift path matches the Python ops path. No API change.
 
-A new `@Suite(.serialized)` test suite that runs a planet-naming coherence prompt against 18 model families to verify end-to-end generation correctness:
+---
 
-| Model | Registry Key |
-|-------|-------------|
-| BitNet b1.58 2B | `LLMRegistry.bitnet_b1_58_2b_4t_4bit` |
-| EXAONE 4.0 1.2B | `LLMRegistry.exaone_4_0_1_2b_4bit` |
-| Gemma 3 1B QAT | `LLMRegistry.gemma3_1B_qat_4bit` |
-| Gemma 3n E2B | `LLMRegistry.gemma3n_E2B_it_lm_4bit` |
-| Gemma 4 E2B | `LLMRegistry.gemma4_e2b_it_4bit` |
-| GLM4 9B | `LLMRegistry.glm4_9b_4bit` |
-| Granite 3.3 2B | `LLMRegistry.granite3_3_2b_4bit` |
-| Granite 4.0-H Tiny | `LLMRegistry.granite_4_0_h_tiny_4bit_dwq` |
-| Jamba 3B | `LLMRegistry.jamba_3b_4bit` |
-| LFM2 1.2B | `LLMRegistry.lfm2_1_2b_4bit` |
-| Llama 3.2 1B | `LLMRegistry.llama3_2_1B_4bit` |
-| Mistral 7B | `LLMRegistry.mistral7B4bit` |
-| OLMo2 7B | `LLMRegistry.olmo_2_1124_7B_Instruct_4bit` |
-| OLMoE 1B×7B | `LLMRegistry.olmoe_1b_7b_0125_instruct_4bit` |
-| Phi 3.5 | `LLMRegistry.phi3_5_4bit` |
-| Qwen3 1.7B | `LLMRegistry.qwen3_1_7b_4bit` |
-| Qwen3.5 2B | `LLMRegistry.qwen3_5_2b_4bit` |
-| SmolLM3 3B | `LLMRegistry.smollm3_3b_4bit` |
+## Bug Fixes — iOS Critical
 
-**Refactored:** `ToolCallIntegrationTests.swift` — model-specific container helper methods (`lfm2Container()`, `glm4Container()`, etc.) replaced with the unified `llmContainer(for:)` call, consolidating Task lifecycle management in one place.
+### IOSurface Exhaustion Fix in VLM Image Processing (#226, #268)
+Two related fixes for `CIContext` misuse in the vision pipeline:
+1. **Intermediate caching disabled** — `CIContext` was caching Metal-backed `IOSurface` objects internally between frames. On iOS, the `IOSurface` pool is small; this caused silent OOM or GPU command failures after a few vision turns. Caching is now disabled.
+2. **Shared `CIContext` removed from media processing** — a single shared `CIContext` was held across concurrent vision requests, causing data races and IOSurface double-free. Each processing path now creates its own context.
 
-**iOS Impact:** None on production code. Test-only change that indirectly validates iOS-runnable model families.
+These fixes make VLM image inference significantly more stable on iPhone / iPad, especially in multi-turn conversations with images.
+
+### Hybrid SSM: 2× Memory Waste Eliminated (#229)
+`segsum` dtype promotion in hybrid SSM models (e.g., Jamba, Falcon H1, Mamba-hybrid) was needlessly upcasting intermediate tensors, doubling peak memory usage during certain attention kernel paths. This is now fixed. On 8 GB iPhone models this can be the difference between a successful inference and an OOM termination.
+
+### UserInput Multimodal Init Fixed (#182, #253)
+`UserInput` initializers that accepted images or videos were not propagating them into the stored `self.images` / `self.videos` properties. This silently dropped multimodal context — text-only output from a VLM that received an image. Now fixed.
+
+---
+
+## Bug Fixes — Model Accuracy
+
+### Gemma 4 MoE Router (#228)
+Two bugs in the Gemma 4 MoE gating path:
+1. `softmax` was applied before rather than after the expert logit computation, inverting routing probabilities.
+2. Norm dispatches were not fused, causing redundant computations per expert. Both are now corrected.
+
+### Gemma3n RoPE Offset (#280)
+`ropeOffset` in `Gemma3NText` was incorrectly applied, causing positional encoding errors on longer sequences. Fixed to match the reference implementation.
+
+### EmbeddingGemma Init-Order Crash + Dense Head (#223)
+`EmbeddingGemma` had an init-order issue where the dense output head was configured before the model's hidden size was resolved, causing a crash on some variants. Also fixes the dense head hidden-size computation for non-standard vocab sizes.
+
+### TokenRing 2D Prompt Flatten (#168, #170)
+`TokenRing.loadPrompt` could receive 2D `[batch, seq]` prompt arrays from certain code paths but assumed 1D. The token ring now flattens 2D inputs, preventing index-out-of-bounds on hybrid/SSM models with batched prompts.
+
+---
+
+## Concurrency
+
+### TokenLoopHandler Sendable Removed (#284)
+`TokenLoopHandler` no longer requires `Sendable` conformance. This was blocking adoption in non-`Sendable` contexts and the conformance was unnecessary given the existing actor isolation. No behavior change; reduces `@unchecked Sendable` boilerplate at call sites.
 
 ---
 
 ## Risk Assessment
 
-| Area | Risk | Rationale |
-|------|------|-----------|
-| Qwen3.5 VLM fix | **Low** | Single defensive guard at function entry; only affects previously-crashing code paths. 2D inputs pass through unchanged. |
-| Coherence test suite | **None** | Test-only code, not compiled into the app target. |
-| API surface | **None** | No public API changes. |
-| Other model families | **None** | Changes are isolated to `Qwen35.swift`; no shared infrastructure modified. |
-| Dependency versions | **None** | No package version bumps in this range. |
+| Area | Risk | Notes |
+|------|------|-------|
+| asyncEval prefill pipeline | **Low–Medium** | New scheduling path for GDN models; existing non-GDN models unaffected. Tested on M5 Max. iOS simulator behavior may differ slightly from device. |
+| fp32 GatedDelta state | **Low** | Output quality improves; no API change. Slightly higher peak memory for GDN state tensors (fp32 vs bf16), negligible on device. |
+| CIContext / IOSurface fix | **Low** | Strictly defensive; eliminates a crash path. No functional change to vision output. |
+| segsum dtype fix | **Low** | Reduces peak memory — no output change. |
+| UserInput multimodal init | **Low** | Bug fix; callers relying on the broken silent-drop behavior would have to explicitly re-add images, but this scenario is unlikely. |
+| ParoQuant | **Low** | New code path; only activates for ParoQuant-quantized models not yet in our registry. |
+| Tool schema forwarding | **Low** | Additive; improves parsing correctness for existing tool-calling flows. |
+| FusedGateUpSwitchGLU | **Low** | Fused kernel path guarded by model config; falls back automatically if unsupported. |
+| Gemma 4 MoE router | **Low** | Bug fix for existing Gemma 4 MoE users; no regressions for non-MoE models. |
 
-**Overall upgrade risk: LOW.** The only production change is a crash fix. Rolling back would re-expose the Qwen3.5 VLM text-only crash.
-
----
-
-## Recommended Actions
-
-1. Run `ToolRunShellTests` and any local MLX model tests to confirm no regressions.
-2. Verify Qwen3.5 VL models load and respond to text-only prompts without crashing on device.
-3. No config, JSON, or localization changes required.
+**Overall upgrade risk: Low.** The release is dominated by targeted bug fixes and one major performance improvement (asyncEval prefill). The most impactful change for iOS users is the IOSurface exhaustion fix (#226 / #268) — VLM image inference becomes meaningfully more stable on device.
