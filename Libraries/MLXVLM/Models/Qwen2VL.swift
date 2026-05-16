@@ -716,8 +716,9 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
 
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // wangqi modified 2026-05-15
-        let tail = chunkedVLMPrefill(
+        // Closure returns LMOutput so the helper's final residue pass yields logits
+        // — keeps vision embeddings in the prefill — wangqi modified 2026-05-16
+        return chunkedVLMPrefill(
             inputIds: input.text.tokens,
             inputEmbeddings: inputEmbeddings,
             visualMask: nil,
@@ -725,9 +726,8 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { _, embChunk, _, _ in
-            _ = self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
+            return self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
         }
-        return .tokens(tail)
 #else
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
         return .logits(result)

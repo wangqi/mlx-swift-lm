@@ -1036,9 +1036,10 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
         // Precomputed M-RoPE positionIds on languageModel are full-length and indexed
-        // by cache offset per chunk, so chunking remains consistent.
-        // wangqi modified 2026-05-15
-        let tail = chunkedVLMPrefill(
+        // by cache offset per chunk, so chunking remains consistent. Closure returns
+        // LMOutput; helper's final residue pass yields logits with vision embeddings
+        // included — wangqi modified 2026-05-16
+        return chunkedVLMPrefill(
             inputIds: input.text.tokens,
             inputEmbeddings: inputEmbeddings,
             visualMask: nil,
@@ -1046,9 +1047,8 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { _, embChunk, _, _ in
-            _ = self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
+            return self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
         }
-        return .tokens(tail)
 #else
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
         return .logits(result)

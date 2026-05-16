@@ -1679,9 +1679,12 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort on Metal.
-        // wangqi modified 2026-05-15
+        // Closure now returns LMOutput so the helper's final residue pass produces
+        // sampler-ready logits — fixes image-blind regression and removes the
+        // extra text-only callAsFunction hop on every prompt.
+        // wangqi modified 2026-05-16
         MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
-        let tail = chunkedVLMPrefill(
+        let result = chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: inputEmbeddings,
             visualMask: visualMask,
@@ -1689,7 +1692,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { idsChunk, embChunk, maskChunk, deepstackChunk in
-            _ = self.languageModel(
+            return self.languageModel(
                 idsChunk ?? inputIds,
                 cache: typedCache,
                 inputEmbeddings: embChunk,
@@ -1701,8 +1704,8 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
                 imageGridTHW: nil,
                 videoGridTHW: nil)
         }
-        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill done tail=\(tail.tokens.size)")
-        return .tokens(tail)
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill done")
+        return result
 #else
         // Single forward pass over the entire prompt — this is the likely abort site for
         // long tool-expanded prompts — wangqi modified 2026-05-15

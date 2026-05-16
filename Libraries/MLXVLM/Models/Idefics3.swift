@@ -736,8 +736,9 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         )
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // wangqi modified 2026-05-15
-        let tail = chunkedVLMPrefill(
+        // Closure returns LMOutput; helper's final residue pass yields logits with
+        // vision embeddings included — wangqi modified 2026-05-16
+        return chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: embeddings,
             visualMask: nil,
@@ -745,9 +746,8 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { _, embChunk, _, _ in
-            _ = self.languageModel(nil, cache: cache, inputs_embeds: embChunk)
+            return self.languageModel(nil, cache: cache, inputs_embeds: embChunk)
         }
-        return .tokens(tail)
 #else
         let result = languageModel(nil, cache: cache, inputs_embeds: embeddings)
         return .logits(result)

@@ -882,8 +882,10 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
 
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // wangqi modified 2026-05-15
-        let tail = chunkedVLMPrefill(
+        // Closure returns LMOutput (wrapping languageModel's raw logits) so the
+        // helper's final residue pass yields sampler-ready logits with vision
+        // embeddings included — wangqi modified 2026-05-16
+        return chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: embeddings,
             visualMask: nil,
@@ -891,9 +893,9 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { idsChunk, embChunk, _, _ in
-            _ = self.languageModel(idsChunk ?? inputIds, cache: cache, inputsEmbeds: embChunk)
+            let logits = self.languageModel(idsChunk ?? inputIds, cache: cache, inputsEmbeds: embChunk)
+            return LMOutput(logits: logits)
         }
-        return .tokens(tail)
 #else
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
         return .logits(.init(logits: logits))

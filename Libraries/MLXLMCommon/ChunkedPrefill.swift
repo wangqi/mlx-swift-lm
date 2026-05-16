@@ -2,12 +2,18 @@
 // Mirrors the LLM chunked prefill (LLMModel.swift) so VLM prepare() does not
 // produce a [1, n_heads, N, N] attention activation for large N (Metal abort).
 // wangqi added 2026-05-15
+// Reshape: closure returns LMOutput and helper returns PrepareResult.logits,
+// so vision embeddings in the residue chunk are still fed through the model's
+// own languageModel(...) (not the text-only callAsFunction) and the sampler
+// receives logits directly — wangqi modified 2026-05-16
 
 import Foundation
 import MLX
 
 /// Per-chunk closure the VLM model provides to feed a slice through its own
-/// `languageModel`. Side effect is the KV cache update; return value ignored.
+/// `languageModel`. The closure must return the model's `LMOutput`; the helper
+/// uses the final-chunk return value as the sampler-ready logits and discards
+/// the intermediate returns.
 ///
 /// `idsChunk` matches the rank of the original `inputIds` (2D `[1, step]` if
 /// the VLM processor emitted 2D tokens, 1D `[step]` otherwise) so the model's
@@ -18,12 +24,13 @@ public typealias VLMChunkFeed = (
     _ embeddingsChunk: MLXArray?,
     _ visualMaskChunk: MLXArray?,
     _ deepstackChunk: [MLXArray]?
-) -> Void
+) -> LMOutput
 
 /// Chunked prefill helper shared by all VLM models on iOS. Caller has already
 /// done vision-feature extraction. This function feeds the (text- or
-/// embedding-) sequence to the model in windowSize-sized slices, returning the
-/// short tail for TokenIterator to finish with step().
+/// embedding-) sequence to the model in windowSize-sized slices, then runs one
+/// final pass over the residue so vision embeddings in `[fed..<totalLen]` are
+/// still seen by the model. Returns `.logits(LMOutput)` from that final pass.
 ///
 /// Shape contracts:
 /// - `inputIds`: typically 2D `[1, seq]` from VLM processors (`.expandedDimensions(axis: 0)`).
@@ -31,9 +38,6 @@ public typealias VLMChunkFeed = (
 /// - `inputEmbeddings`: when non-nil, shape `[1, seq, dim]`; drives chunk length.
 /// - `visualMask`: shape `[1, seq]`; required when `deepstackEmbeds` is set.
 /// - `deepstackEmbeds`: list of `[numVisualTokens, dim]` arrays (Qwen3VL only).
-///
-/// Returns the tail as 1D `[tail]` `LMInput.Text` — TokenIterator's `step()`
-/// adds the batch axis via `previous[text: .newAxis]`.
 public func chunkedVLMPrefill(
     inputIds: MLXArray,
     inputEmbeddings: MLXArray?,
@@ -42,7 +46,7 @@ public func chunkedVLMPrefill(
     cache: [any KVCache],
     windowSize: Int?,
     feedChunk: VLMChunkFeed
-) -> LMInput.Text {
+) -> PrepareResult {
     let prefillStepSize = windowSize ?? 512
     let inputIdsIs2D = inputIds.ndim == 2
     let totalLen: Int = {
@@ -84,14 +88,24 @@ public func chunkedVLMPrefill(
             return all.map { $0[sDS ..< eDS, 0...] }
         }
 
-        feedChunk(idsChunk, embChunk, maskChunk, deepstackChunk)
+        _ = feedChunk(idsChunk, embChunk, maskChunk, deepstackChunk)
         asyncEval(cache)
         fed = end
     }
-    eval(cache)
 
-    // Tail must be 1D — TokenIterator.step() does `previous[text: .newAxis]`
-    // which adds axis 0 to tokens, producing the expected [1, tail] shape.
-    let tailTokens: MLXArray = inputIdsIs2D ? inputIds[0, fed...] : inputIds[fed...]
-    return LMInput.Text(tokens: tailTokens)
+    // Final pass over residue [fed ..< totalLen] (or full prompt if loop never
+    // ran). Vision embeddings in the residue are seen here — this is the fix
+    // for the image-blind regression. Result is the sampler-ready logits.
+    let idsTail: MLXArray = inputIdsIs2D ? inputIds[0..., fed ..< totalLen] : inputIds[fed ..< totalLen]
+    let embTail: MLXArray? = inputEmbeddings.map { $0[0..., fed ..< totalLen, 0...] }
+    let maskTail: MLXArray? = visualMask.map { $0[0..., fed ..< totalLen] }
+    let deepstackTail: [MLXArray]? = deepstackEmbeds.map { all in
+        let sDS = fed == 0 ? 0 : visualCumulative[fed - 1]
+        let eDS = visualCumulative[totalLen - 1]
+        return all.map { $0[sDS ..< eDS, 0...] }
+    }
+
+    let finalOutput = feedChunk(idsTail, embTail, maskTail, deepstackTail)
+    eval(cache)
+    return .logits(finalOutput)
 }

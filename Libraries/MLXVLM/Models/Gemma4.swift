@@ -1738,9 +1738,10 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             return .logits(result)
         } else {
 #if os(iOS) || targetEnvironment(macCatalyst)
-            // Chunked prefill on iOS / Catalyst for text-only path.
-            // wangqi modified 2026-05-15
-            let tail = chunkedVLMPrefill(
+            // Chunked prefill on iOS / Catalyst for text-only path. Closure returns
+            // LMOutput so helper's final residue pass yields logits without going
+            // through the text-only callAsFunction — wangqi modified 2026-05-16
+            return chunkedVLMPrefill(
                 inputIds: input.text.tokens,
                 inputEmbeddings: nil,
                 visualMask: nil,
@@ -1748,9 +1749,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 cache: cache,
                 windowSize: windowSize
             ) { idsChunk, _, _, _ in
-                _ = self.languageModel(idsChunk, cache: convertedCache)
+                return self.languageModel(idsChunk, cache: convertedCache)
             }
-            return .tokens(tail)
 #else
             let result = languageModel(input.text.tokens, cache: convertedCache)
             return .logits(result)

@@ -989,8 +989,9 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
 
         if input.image?.pixels == nil {
 #if os(iOS) || targetEnvironment(macCatalyst)
-            // wangqi modified 2026-05-15
-            let tail = chunkedVLMPrefill(
+            // Closure returns LMOutput; helper's final residue pass yields logits
+            // — wangqi modified 2026-05-16
+            return chunkedVLMPrefill(
                 inputIds: input.text.tokens,
                 inputEmbeddings: nil,
                 visualMask: nil,
@@ -998,10 +999,9 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
                 cache: cache,
                 windowSize: windowSize
             ) { idsChunk, _, _, _ in
-                _ = self.languageModel(
+                return self.languageModel(
                     idsChunk, cache: convertedCache, inputEmbedding: nil, mask: nil)
             }
-            return .tokens(tail)
 #else
             let result = languageModel(
                 input.text.tokens, cache: convertedCache, inputEmbedding: nil, mask: nil)
@@ -1019,8 +1019,9 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
 
 #if os(iOS) || targetEnvironment(macCatalyst)
-        // wangqi modified 2026-05-15
-        let tail = chunkedVLMPrefill(
+        // Closure returns LMOutput; helper's final residue pass yields logits with
+        // vision embeddings included — wangqi modified 2026-05-16
+        return chunkedVLMPrefill(
             inputIds: input.text.tokens,
             inputEmbeddings: inputEmbeddings,
             visualMask: nil,
@@ -1028,10 +1029,9 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { _, embChunk, _, _ in
-            _ = self.languageModel(
+            return self.languageModel(
                 nil, cache: convertedCache, inputEmbedding: embChunk, mask: maskMode)
         }
-        return .tokens(tail)
 #else
         let result = languageModel(
             nil,  // Pass nil for tokens when using embeddings

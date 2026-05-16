@@ -1133,6 +1133,17 @@ public class Qwen35: Module, VLMModel {
 
         var inputEmbeddings: MLXArray?
 
+        // Always reset M-RoPE position state at the start of prepare so a prior
+        // turn's `precomputedPositionIds` (sized to the previous prompt) can't
+        // leak into this turn. On the iOS chunked path the closure passes
+        // `pixelValues: nil`, so callAsFunction's image-triggered auto-reset
+        // (Qwen35Language.LanguageModel.callAsFunction lines 928–931) does NOT
+        // fire — and the slicing branch on line 949 would otherwise reuse a
+        // stale precomputed tensor of the wrong length and crash in
+        // applyMultimodalRotaryPosEmb with a (1,8,N,64) vs (1,1,prev,64)
+        // broadcast mismatch. wangqi modified 2026-05-16
+        languageModel.resetPositionState()
+
         if let pixelValues,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
@@ -1149,8 +1160,26 @@ public class Qwen35: Module, VLMModel {
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
-        } else {
-            languageModel.resetPositionState()
+
+            // Pre-compute full-prompt M-RoPE positions WITH `imageGridTHW` so
+            // image tokens get correct positions. The chunked closure passes
+            // `imageGridTHW: nil`, so without this precompute the per-chunk
+            // getRopeIndex call would degrade image positions to text-only
+            // sequential positions. With this set, callAsFunction's slicing
+            // branch hands out the correct slice per chunk via cacheOffset.
+            // wangqi modified 2026-05-16
+            let normalizedIds = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
+            let (computedPositions, computedDeltas) = Qwen3VLLanguage.getRopeIndex(
+                inputIds: normalizedIds,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames,
+                spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                imageTokenId: config.imageTokenId,
+                videoTokenId: config.videoTokenId,
+                visionStartTokenId: config.visionStartTokenId,
+                attentionMask: nil)
+            languageModel.precomputedPositionIds = computedPositions
+            languageModel.ropeDeltas = computedDeltas
         }
 
         let typedCache = castCache(cache)
@@ -1158,9 +1187,11 @@ public class Qwen35: Module, VLMModel {
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort on Metal
         // and the high-watermark memory kill that follows a 6 K-token tools-expanded prompt.
-        // wangqi modified 2026-05-15
+        // Closure now returns LMOutput so the helper's final residue pass produces
+        // sampler-ready logits — fixes image-blind / slow-text regression.
+        // wangqi modified 2026-05-16
         MLXLogCollector.shared.log("[Qwen35.model.prepare] chunked prefill inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
-        let tail = chunkedVLMPrefill(
+        let result = chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: inputEmbeddings,
             visualMask: nil,
@@ -1168,7 +1199,7 @@ public class Qwen35: Module, VLMModel {
             cache: cache,
             windowSize: windowSize
         ) { idsChunk, embChunk, _, _ in
-            _ = self.languageModel(
+            return self.languageModel(
                 idsChunk ?? inputIds,
                 inputsEmbeds: embChunk,
                 cache: typedCache,
@@ -1178,8 +1209,8 @@ public class Qwen35: Module, VLMModel {
                 imageGridTHW: nil,
                 videoGridTHW: nil)
         }
-        MLXLogCollector.shared.log("[Qwen35.model.prepare] chunked prefill done tail=\(tail.tokens.size)")
-        return .tokens(tail)
+        MLXLogCollector.shared.log("[Qwen35.model.prepare] chunked prefill done")
+        return result
 #else
         let output = languageModel(
             inputIds,
