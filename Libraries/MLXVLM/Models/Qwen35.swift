@@ -1108,7 +1108,7 @@ public class Qwen35: Module, VLMModel {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
         let inputIds = input.text.tokens
 
@@ -1154,6 +1154,33 @@ public class Qwen35: Module, VLMModel {
         }
 
         let typedCache = castCache(cache)
+
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort on Metal
+        // and the high-watermark memory kill that follows a 6 K-token tools-expanded prompt.
+        // wangqi modified 2026-05-15
+        MLXLogCollector.shared.log("[Qwen35.model.prepare] chunked prefill inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
+        let tail = chunkedVLMPrefill(
+            inputIds: inputIds,
+            inputEmbeddings: inputEmbeddings,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            cache: cache,
+            windowSize: windowSize
+        ) { idsChunk, embChunk, _, _ in
+            _ = self.languageModel(
+                idsChunk ?? inputIds,
+                inputsEmbeds: embChunk,
+                cache: typedCache,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+        }
+        MLXLogCollector.shared.log("[Qwen35.model.prepare] chunked prefill done tail=\(tail.tokens.size)")
+        return .tokens(tail)
+#else
         let output = languageModel(
             inputIds,
             inputsEmbeds: inputEmbeddings,
@@ -1166,6 +1193,7 @@ public class Qwen35: Module, VLMModel {
         )
 
         return .logits(output)
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

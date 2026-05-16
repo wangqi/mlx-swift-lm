@@ -70,12 +70,15 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        // Trace tool-injected template render to localize tools-related prefill crashes — wangqi modified 2026-05-15
+        MLXLogCollector.shared.log("[Qwen3VL.prepare] tools=\(input.tools?.count ?? 0) hasImages=\(!input.images.isEmpty) hasVideos=\(!input.videos.isEmpty)")
         let messages = Qwen3VLMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages,
             tools: input.tools,
             additionalContext: input.additionalContext
         )
+        MLXLogCollector.shared.log("[Qwen3VL.prepare] applyChatTemplate => \(promptTokens.count) tokens")
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
@@ -1606,8 +1609,12 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
+        // Trace VLM prefill — Qwen3VL evaluates the entire prompt in a single forward pass
+        // (windowSize ignored). On long prompts (e.g. tools-expanded), the languageModel(...)
+        // call below can abort at Metal level — wangqi modified 2026-05-15
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] enter promptTokens=\(input.text.tokens.size) hasImage=\(input.image != nil) hasVideo=\(input.video != nil)")
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?
@@ -1670,6 +1677,36 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let typedCache = castCache(cache)
 
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort on Metal.
+        // wangqi modified 2026-05-15
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
+        let tail = chunkedVLMPrefill(
+            inputIds: inputIds,
+            inputEmbeddings: inputEmbeddings,
+            visualMask: visualMask,
+            deepstackEmbeds: deepstackEmbeds,
+            cache: cache,
+            windowSize: windowSize
+        ) { idsChunk, embChunk, maskChunk, deepstackChunk in
+            _ = self.languageModel(
+                idsChunk ?? inputIds,
+                cache: typedCache,
+                inputEmbeddings: embChunk,
+                mask: nil,
+                positionIds: nil,
+                visualMask: maskChunk,
+                deepstackEmbeds: deepstackChunk,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+        }
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill done tail=\(tail.tokens.size)")
+        return .tokens(tail)
+#else
+        // Single forward pass over the entire prompt — this is the likely abort site for
+        // long tool-expanded prompts — wangqi modified 2026-05-15
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] calling languageModel(...) inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
         let languageOutput = languageModel(
             inputIds,
             cache: typedCache,
@@ -1681,8 +1718,10 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues,
             imageGridTHW: imageFrames,
             videoGridTHW: videoFrames)
+        MLXLogCollector.shared.log("[Qwen3VL.model.prepare] languageModel returned")
 
         return .logits(languageOutput)
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

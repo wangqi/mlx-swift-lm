@@ -1033,9 +1033,26 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
+        // Precomputed M-RoPE positionIds on languageModel are full-length and indexed
+        // by cache offset per chunk, so chunking remains consistent.
+        // wangqi modified 2026-05-15
+        let tail = chunkedVLMPrefill(
+            inputIds: input.text.tokens,
+            inputEmbeddings: inputEmbeddings,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            cache: cache,
+            windowSize: windowSize
+        ) { _, embChunk, _, _ in
+            _ = self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
+        }
+        return .tokens(tail)
+#else
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
-
         return .logits(result)
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

@@ -650,7 +650,11 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))
+            // Trace the asyncEval kick-off so we can tell prefill aborts (here) from
+            // graph-build issues earlier — wangqi modified 2026-05-15
+            MLXLogCollector.shared.log("[TokenIterator.prepare] entering asyncEval (.logits branch, prompt=\(input.text.tokens.size))")
             asyncEval(y.tokens)
+            MLXLogCollector.shared.log("[TokenIterator.prepare] asyncEval returned (.logits branch)")
 
             break
         }
@@ -1362,8 +1366,12 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     fallbackToolCallParser: (any ToolCallParser)? = nil
 ) throws -> AsyncStream<Generation> {
+    // Trace prefill so we can tell whether crashes happen inside TokenIterator(...) (prompt eval)
+    // versus the streaming loop downstream — wangqi modified 2026-05-15
+    MLXLogCollector.shared.log("[Evaluate.generate] enter promptTokens=\(input.text.tokens.size) hasCache=\(cache != nil)")
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
+    MLXLogCollector.shared.log("[Evaluate.generate] tokenIterator built")
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,

@@ -1140,9 +1140,24 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask: pixelAttentionMask
         )
 
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
+        // wangqi modified 2026-05-15
+        let tail = chunkedVLMPrefill(
+            inputIds: input.text.tokens,
+            inputEmbeddings: inputEmbeddings,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            cache: cache,
+            windowSize: windowSize
+        ) { _, embChunk, _, _ in
+            _ = self.languageModel(nil, cache: cache, inputsEmbeds: embChunk)
+        }
+        return .tokens(tail)
+#else
         let result = languageModel(nil, cache: cache, inputsEmbeds: inputEmbeddings)
-
         return .logits(result)
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

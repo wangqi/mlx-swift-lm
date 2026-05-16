@@ -1724,6 +1724,9 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     {
         let convertedCache = cache.map { $0 }
         if let imagePixels = input.image?.pixels {
+            // Image path uses perLayerInputs alongside embeddings; chunking that pair
+            // is not supported by the shared helper, so keep single-shot for vision.
+            // wangqi modified 2026-05-15
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
             let result = languageModel(
@@ -1734,8 +1737,24 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             )
             return .logits(result)
         } else {
+#if os(iOS) || targetEnvironment(macCatalyst)
+            // Chunked prefill on iOS / Catalyst for text-only path.
+            // wangqi modified 2026-05-15
+            let tail = chunkedVLMPrefill(
+                inputIds: input.text.tokens,
+                inputEmbeddings: nil,
+                visualMask: nil,
+                deepstackEmbeds: nil,
+                cache: cache,
+                windowSize: windowSize
+            ) { idsChunk, _, _, _ in
+                _ = self.languageModel(idsChunk, cache: convertedCache)
+            }
+            return .tokens(tail)
+#else
             let result = languageModel(input.text.tokens, cache: convertedCache)
             return .logits(result)
+#endif
         }
     }
 

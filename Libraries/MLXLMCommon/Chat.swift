@@ -129,8 +129,11 @@ extension MessageGenerator {
             }
             return raw
         }
-        // wangqi modified 2026-03-10: Debug log to verify tool field injection before applyChatTemplate
-        print("[Chat.generate] \(result.count) msgs: \(result.map { (($0["role"] as? String) ?? "?") + ($0["tool_calls"] != nil ? "+TC" : "") + ($0["tool_call_id"] != nil ? "+TR" : "") }.joined(separator: " -> "))")
+        // Route through MLXLogCollector so the line follows the same on/off / chaining policy
+        // as other mlx-swift-lm internal logs — wangqi modified 2026-05-15
+        if MLXLogCollector.shared.hasHandler {
+            MLXLogCollector.shared.log("[Chat.generate] \(result.count) msgs: \(result.map { (($0["role"] as? String) ?? "?") + ($0["tool_calls"] != nil ? "+TC" : "") + ($0["tool_call_id"] != nil ? "+TR" : "") }.joined(separator: " -> "))")
+        }
         return result
     }
 

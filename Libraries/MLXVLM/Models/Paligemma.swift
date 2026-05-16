@@ -607,6 +607,13 @@ public class PaliGemma: Module, VLMModel, KVCacheDimensionProvider {
         let (inputEmbedding, finalAttentionMask4d) = inputEmbeddings(
             inputIds: inputIds, pixelValues: image.pixels, mask: mask)
 
+        // NOTE: PaliGemma uses a prefix-LM 4D attention mask of shape
+        // [1, 1, seq, seq] coupling all tokens bidirectionally with the image
+        // prefix. Slicing this across chunks would break the prefix attention
+        // pattern, so this model stays single-shot on all platforms. The image
+        // path is image-required and typically short, so it is not the dominant
+        // crash source the chunked helper targets.
+        // wangqi modified 2026-05-15
         let result = languageModel(
             inputIds, cache: cache, inputEmbedding: inputEmbedding, mask: finalAttentionMask4d)
 

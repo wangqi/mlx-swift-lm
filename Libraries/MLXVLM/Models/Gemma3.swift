@@ -985,24 +985,54 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        guard let imagePixels = input.image?.pixels else {
-            // Text-only input
-            let convertedCache = cache.compactMap { $0 as KVCache }
+        let convertedCache = cache.compactMap { $0 as KVCache }
+
+        if input.image?.pixels == nil {
+#if os(iOS) || targetEnvironment(macCatalyst)
+            // wangqi modified 2026-05-15
+            let tail = chunkedVLMPrefill(
+                inputIds: input.text.tokens,
+                inputEmbeddings: nil,
+                visualMask: nil,
+                deepstackEmbeds: nil,
+                cache: cache,
+                windowSize: windowSize
+            ) { idsChunk, _, _, _ in
+                _ = self.languageModel(
+                    idsChunk, cache: convertedCache, inputEmbedding: nil, mask: nil)
+            }
+            return .tokens(tail)
+#else
             let result = languageModel(
                 input.text.tokens, cache: convertedCache, inputEmbedding: nil, mask: nil)
             return .logits(result)
+#endif
         }
 
         let (inputEmbeddings, _) = getInputEmbeddings(
             inputIds: input.text.tokens,
-            pixelValues: imagePixels,
+            pixelValues: input.image!.pixels,
             mask: input.text.mask
         )
 
-        let convertedCache = cache.compactMap { $0 as KVCache }
         // Use causal masking for text generation
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
 
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // wangqi modified 2026-05-15
+        let tail = chunkedVLMPrefill(
+            inputIds: input.text.tokens,
+            inputEmbeddings: inputEmbeddings,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            cache: cache,
+            windowSize: windowSize
+        ) { _, embChunk, _, _ in
+            _ = self.languageModel(
+                nil, cache: convertedCache, inputEmbedding: embChunk, mask: maskMode)
+        }
+        return .tokens(tail)
+#else
         let result = languageModel(
             nil,  // Pass nil for tokens when using embeddings
             cache: convertedCache,
@@ -1011,6 +1041,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         )
 
         return .logits(result)
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

@@ -880,8 +880,24 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues
         )
 
+#if os(iOS) || targetEnvironment(macCatalyst)
+        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
+        // wangqi modified 2026-05-15
+        let tail = chunkedVLMPrefill(
+            inputIds: inputIds,
+            inputEmbeddings: embeddings,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            cache: cache,
+            windowSize: windowSize
+        ) { idsChunk, embChunk, _, _ in
+            _ = self.languageModel(idsChunk ?? inputIds, cache: cache, inputsEmbeds: embChunk)
+        }
+        return .tokens(tail)
+#else
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
         return .logits(.init(logits: logits))
+#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
