@@ -1695,9 +1695,15 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache,
             windowSize: windowSize
         ) { idsChunk, embChunk, maskChunk, deepstackChunk in
+            // Pass state: nil so each chunk's callAsFunction lazily computes
+            // (and caches into its own local state copy) the M-RoPE positions;
+            // ropeDeltas-based autoregressive path handles chunks 2+.
+            // wangqi modified 2026-05-23 — added state: parameter required by
+            // upstream PR #283.
             return self.languageModel(
                 idsChunk ?? inputIds,
                 cache: typedCache,
+                state: nil,
                 inputEmbeddings: embChunk,
                 mask: nil,
                 positionIds: nil,
