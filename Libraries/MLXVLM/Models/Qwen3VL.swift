@@ -12,6 +12,8 @@ private enum Qwen3VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
 
+private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")
+
 // MARK: - Processor
 
 public struct Qwen3VLProcessor: UserInputProcessor {
@@ -1218,8 +1220,6 @@ enum Qwen3VLLanguage {
         let textConfig: Qwen3VLConfiguration.TextConfiguration
         var kvHeads: [Int]
 
-        private var ropeDeltas: MLXArray? = nil
-
         init(_ config: Qwen3VLConfiguration) {
             self.config = config
             self.textConfig = config.textConfiguration
@@ -1239,6 +1239,7 @@ enum Qwen3VLLanguage {
         func callAsFunction(
             _ inputIds: MLXArray?,
             cache: [KVCache]?,
+            state: LMOutput.State?,
             inputEmbeddings: MLXArray?,
             mask: MLXArray?,
             positionIds providedPositionIds: MLXArray?,
@@ -1248,14 +1249,16 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
+            var state = state ?? .init()
+
             if pixelValues != nil {
-                ropeDeltas = nil
+                state[ropeDeltasKey] = nil
             }
 
             var positionIds = providedPositionIds
 
             if positionIds == nil && (mask == nil || mask?.ndim == 2) {
-                if (cache?.first?.offset ?? 0) == 0 || ropeDeltas == nil || cache == nil {
+                if (cache?.first?.offset ?? 0) == 0 || state[ropeDeltasKey] == nil || cache == nil {
                     if let inputIds {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputIds,
@@ -1268,8 +1271,8 @@ enum Qwen3VLLanguage {
                             attentionMask: mask)
 
                         positionIds = computed
-                        ropeDeltas = deltas
-                    } else if let cache, ropeDeltas == nil {
+                        state[ropeDeltasKey] = deltas
+                    } else if let cache, state[ropeDeltasKey] == nil {
                         let batch = inputEmbeddings!.dim(0)
                         let seqLength = inputEmbeddings!.dim(1)
                         let currentOffset = cache.first?.offset ?? 0
@@ -1282,7 +1285,7 @@ enum Qwen3VLLanguage {
                         positionIds = base[.newAxis, 0..., 0...]
                         positionIds = tiled(positionIds!, repetitions: [3, batch, seqLength])
                     }
-                } else if let cache, let ropeDeltas {
+                } else if let cache, let ropeDeltas = state[ropeDeltasKey] {
                     let batch = (inputIds ?? inputEmbeddings!).dim(0)
                     let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
 
@@ -1320,7 +1323,7 @@ enum Qwen3VLLanguage {
                 output = model.embedTokens.asLinear(output)
             }
 
-            return LMOutput(logits: output)
+            return LMOutput(logits: output, state: state)
         }
 
     }
@@ -1713,6 +1716,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         let languageOutput = languageModel(
             inputIds,
             cache: typedCache,
+            state: nil,
             inputEmbeddings: inputEmbeddings,
             mask: nil,
             positionIds: nil,
@@ -1727,12 +1731,15 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 #endif
     }
 
-    public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
         let typedCache = castCacheOptional(cache)
 
         let result = languageModel(
-            inputs,
+            input.tokens,
             cache: typedCache,
+            state: state,
             inputEmbeddings: nil,
             mask: nil,
             positionIds: nil,
@@ -1741,7 +1748,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil
-        ).logits
+        )
         return result
     }
 

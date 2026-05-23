@@ -734,10 +734,11 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: inputIds,
             pixelValues: pixelValues
         )
-#if os(iOS) || targetEnvironment(macCatalyst)
-        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // Closure returns LMOutput; helper's final residue pass yields logits with
-        // vision embeddings included — wangqi modified 2026-05-16
+        // Chunked prefill on every platform (upstream PR #297 enabled chunking on
+        // macOS too). Use the shared chunkedVLMPrefill helper so iOS / Catalyst
+        // still avoid the [1, h, N, N] Metal attention abort, and macOS honors
+        // windowSize. Closure returns LMOutput; helper's final residue pass yields
+        // logits with vision embeddings included — wangqi modified 2026-05-16
         return chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: embeddings,
@@ -748,10 +749,6 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         ) { _, embChunk, _, _ in
             return self.languageModel(nil, cache: cache, inputs_embeds: embChunk)
         }
-#else
-        let result = languageModel(nil, cache: cache, inputs_embeds: embeddings)
-        return .logits(result)
-#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

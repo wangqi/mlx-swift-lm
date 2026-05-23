@@ -79,7 +79,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     case glm4
 
     /// Gemma function call format (Gemma 1-3).
-    /// Example: `call:name{key:value,k:<escape>str<escape>}`
+    /// Example: `<start_function_call>call:name{key:value,k:<escape>str<escape>}<end_function_call>`
     case gemma
 
     // wangqi modified 2026-04-13
@@ -119,8 +119,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
-            return GemmaFunctionParser()
+            // Gemma 1-3: use the upstream parameterized parser.
+            return GemmaFunctionParser(
+                startTag: "<start_function_call>", endTag: "<end_function_call>",
+                escapeMarker: "<escape>")
         case .gemma4:
+            // Gemma 4: keep the wangqi-custom parser for the double-brace JSON fallback
+            // that handles the Gemma 4 jinja template re-injecting `{{{arguments}}}`.
+            // wangqi modified 2026-04-13
             return Gemma4FunctionParser()
         case .kimiK2:
             return KimiK2ToolCallParser()

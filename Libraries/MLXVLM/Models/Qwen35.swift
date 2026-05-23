@@ -16,6 +16,11 @@ private enum Qwen35VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
 
+private let precomputedPositionIdsKey = LMOutput.Key<MLXArray>(
+    "qwen35.precomputedPositionIds")
+private let ropeDeltasKey = LMOutput.Key<MLXArray>(
+    "qwen35.ropeDeltas")
+
 // MARK: - Gated Delta Helpers
 
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
@@ -884,9 +889,6 @@ enum Qwen35Language {
         let modelType: String
         let kvHeads: [Int]
 
-        fileprivate var precomputedPositionIds: MLXArray? = nil
-        fileprivate var ropeDeltas: MLXArray? = nil
-
         init(_ config: Qwen35Configuration) {
             self.config = config
             self.textConfig = config.textConfiguration
@@ -906,29 +908,29 @@ enum Qwen35Language {
             super.init()
         }
 
-        func resetPositionState() {
-            precomputedPositionIds = nil
-            ropeDeltas = nil
-        }
-
         func callAsFunction(
             _ inputs: MLXArray,
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
+            state: LMOutput.State?,
             mask: MLXArray? = nil,
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
             videoGridTHW: [THW]? = nil
         ) -> LMOutput {
+            var state = state ?? .init()
+
             // Ensure inputs is 2D [batch, seq]. Text-only callers (e.g.
             // WiredMemoryUtils, TokenIterator) may pass 1D token arrays.
             let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
 
             if pixelValues != nil {
-                precomputedPositionIds = nil
-                ropeDeltas = nil
+                state[precomputedPositionIdsKey] = nil
+                state[ropeDeltasKey] = nil
             }
+            let precomputedPositionIds = state[precomputedPositionIdsKey]
+            let ropeDeltas = state[ropeDeltasKey]
 
             var cacheOffset = 0
             if let cache, let faCache = cache[model.faIdx] {
@@ -942,9 +944,21 @@ enum Qwen35Language {
 
             var positionIds = providedPositionIds
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
+                // Force the slicing branch whenever precomputed positions cover the
+                // requested cacheOffset..cacheOffset+seqLen range. Without this,
+                // chunked prefill chunks 2+ (cacheOffset > 0 with ropeDeltas set)
+                // would fall into the autoregressive branch and degrade image
+                // tokens to text-only sequential positions, defeating the whole
+                // point of precomputing M-RoPE positions in prepare().
+                // wangqi modified 2026-05-23
+                let inputSeqLength = inputs.dim(1)
+                let canSlicePrecomputed = precomputedPositionIds.map {
+                    cacheOffset + inputSeqLength <= $0.dim(2)
+                } ?? false
                 if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
                     || ropeDeltas == nil
                     || cache == nil
+                    || canSlicePrecomputed
                 {
                     if let precomputedPositionIds {
                         let seqLength = inputs.dim(1)
@@ -962,8 +976,8 @@ enum Qwen35Language {
                             visionStartTokenId: config.visionStartTokenId,
                             attentionMask: ropeMask)
                         positionIds = computed
-                        precomputedPositionIds = computed
-                        ropeDeltas = deltas
+                        state[precomputedPositionIdsKey] = computed
+                        state[ropeDeltasKey] = deltas
                     }
                 } else {
                     let batchSize = inputs.dim(0)
@@ -1004,7 +1018,7 @@ enum Qwen35Language {
                 out = model.embedTokens.asLinear(out)
             }
 
-            return LMOutput(logits: out)
+            return LMOutput(logits: out, state: state)
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
@@ -1132,17 +1146,12 @@ public class Qwen35: Module, VLMModel {
         }
 
         var inputEmbeddings: MLXArray?
-
-        // Always reset M-RoPE position state at the start of prepare so a prior
-        // turn's `precomputedPositionIds` (sized to the previous prompt) can't
-        // leak into this turn. On the iOS chunked path the closure passes
-        // `pixelValues: nil`, so callAsFunction's image-triggered auto-reset
-        // (Qwen35Language.LanguageModel.callAsFunction lines 928–931) does NOT
-        // fire — and the slicing branch on line 949 would otherwise reuse a
-        // stale precomputed tensor of the wrong length and crash in
-        // applyMultimodalRotaryPosEmb with a (1,8,N,64) vs (1,1,prev,64)
-        // broadcast mismatch. wangqi modified 2026-05-16
-        languageModel.resetPositionState()
+        // M-RoPE state for this prepare() call. Each turn starts with a fresh
+        // LMOutput.State so a prior turn's precomputedPositionIds (sized to
+        // the previous prompt) cannot leak in. Populated below when we have
+        // image/video frames; passed through to every chunk closure and to
+        // the single-shot macOS path. wangqi modified 2026-05-16
+        var preparedState = LMOutput.State()
 
         if let pixelValues,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
@@ -1165,9 +1174,10 @@ public class Qwen35: Module, VLMModel {
             // image tokens get correct positions. The chunked closure passes
             // `imageGridTHW: nil`, so without this precompute the per-chunk
             // getRopeIndex call would degrade image positions to text-only
-            // sequential positions. With this set, callAsFunction's slicing
-            // branch hands out the correct slice per chunk via cacheOffset.
-            // wangqi modified 2026-05-16
+            // sequential positions. With this stored on the per-turn state,
+            // callAsFunction's slicing branch hands out the correct slice per
+            // chunk via cacheOffset (upstream PR #283 moved this off of mutable
+            // model state and onto LMOutput.State). wangqi modified 2026-05-16
             let normalizedIds = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
             let (computedPositions, computedDeltas) = Qwen3VLLanguage.getRopeIndex(
                 inputIds: normalizedIds,
@@ -1178,8 +1188,8 @@ public class Qwen35: Module, VLMModel {
                 videoTokenId: config.videoTokenId,
                 visionStartTokenId: config.visionStartTokenId,
                 attentionMask: nil)
-            languageModel.precomputedPositionIds = computedPositions
-            languageModel.ropeDeltas = computedDeltas
+            preparedState[precomputedPositionIdsKey] = computedPositions
+            preparedState[ropeDeltasKey] = computedDeltas
         }
 
         let typedCache = castCache(cache)
@@ -1203,6 +1213,7 @@ public class Qwen35: Module, VLMModel {
                 idsChunk ?? inputIds,
                 inputsEmbeds: embChunk,
                 cache: typedCache,
+                state: preparedState,
                 mask: nil,
                 positionIds: nil,
                 pixelValues: nil,
@@ -1216,6 +1227,7 @@ public class Qwen35: Module, VLMModel {
             inputIds,
             inputsEmbeds: inputEmbeddings,
             cache: typedCache,
+            state: preparedState,
             mask: input.text.mask,
             positionIds: nil,
             pixelValues: pixelValues,
@@ -1227,19 +1239,22 @@ public class Qwen35: Module, VLMModel {
 #endif
     }
 
-    public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
         let typedCache = castCacheOptional(cache)
         let result = languageModel(
-            inputs,
+            input.tokens,
             inputsEmbeds: nil,
             cache: typedCache,
+            state: state,
             mask: nil,
             positionIds: nil,
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil
         )
-        return result.logits
+        return result
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
