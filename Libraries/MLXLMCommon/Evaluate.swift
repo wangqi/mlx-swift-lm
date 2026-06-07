@@ -2006,8 +2006,8 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
                 }
             }
 
-            // Check if we have a complete tool call.
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+            // Emit all complete tool calls in parse order.
+            for toolCall in toolCallProcessor.drainToolCalls() {
                 if case .terminated = emit(.toolCall(toolCall)) {
                     return false
                 }
@@ -2029,14 +2029,23 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     ) {
         // wangqi modified 2026-04-13: flush any text buffered in pendingOutput before EOS parsing.
         // In normal (non-tool-call) generations, pendingOutput may hold the last few tokens that
-        // arrived without a newline and were not yet flushed by processTaggedChunk.
+        // arrived without a newline and were not yet flushed by processTaggedChunk. This is a
+        // separate buffer from toolCallBuffer, which processEOS drains below.
         if let text = toolCallProcessor.flushPendingOutput() {
-            _ = emit(.chunk(text))
+            if case .terminated = emit(.chunk(text)) {
+                return
+            }
         }
 
-        toolCallProcessor.processEOS()
+        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
+            !bufferedText.isEmpty
+        {
+            if case .terminated = emit(.chunk(bufferedText)) {
+                return
+            }
+        }
 
-        for toolCall in toolCallProcessor.toolCalls {
+        for toolCall in toolCallProcessor.drainToolCalls() {
             if case .terminated = emit(.toolCall(toolCall)) {
                 break
             }

@@ -29,16 +29,33 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let data = jsonStr.data(using: .utf8),
+        guard
+            let data = jsonStr.data(using: .utf8),
             let normalizedData = normalizedToolCallData(from: data),
             let function = try? JSONDecoder().decode(ToolCall.Function.self, from: normalizedData)
-        {
-            return ToolCall(function: function)
+        else {
+            // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
+            // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
+            return XMLFunctionParser().parse(content: content, tools: tools)
         }
 
-        // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
-        // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
-        return XMLFunctionParser().parse(content: content, tools: tools)
+        // If tool schemas are provided, only accept calls to declared tools.
+        if let tools, !tools.isEmpty {
+            var isDeclaredTool = false
+            for tool in tools {
+                let functionSpec = tool["function"] as? [String: any Sendable]
+                if functionSpec?["name"] as? String == function.name {
+                    isDeclaredTool = true
+                    break
+                }
+            }
+
+            guard isDeclaredTool else {
+                return nil
+            }
+        }
+
+        return ToolCall(function: function)
     }
 
     private func normalizedToolCallData(from data: Data) -> Data? {

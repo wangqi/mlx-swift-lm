@@ -14,6 +14,9 @@ public enum Chat {
         /// Array of video data associated with the message.
         public var videos: [UserInput.Video]
 
+        /// Array of audio data associated with the message.
+        public var audios: [UserInput.Audio]
+
         // wangqi modified 2026-03-10: Add optional tool call fields to support multi-turn tool calling
         // via Chat.Message API. toolCalls enables assistant messages with tool call requests;
         // toolCallId/name enable tool result messages. All fields default to nil for backward compatibility.
@@ -27,8 +30,10 @@ public enum Chat {
         public var name: String?
 
         public init(
-            role: Role, content: String, images: [UserInput.Image] = [],
+            role: Role, content: String,
+            images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
+            audios: [UserInput.Audio] = [],
             toolCalls: [[String: any Sendable]]? = nil,
             toolCallId: String? = nil,
             name: String? = nil
@@ -37,6 +42,7 @@ public enum Chat {
             self.content = content
             self.images = images
             self.videos = videos
+            self.audios = audios
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
             self.name = name
@@ -57,9 +63,12 @@ public enum Chat {
         }
 
         public static func user(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String,
+            images: [UserInput.Image] = [],
+            videos: [UserInput.Video] = [],
+            audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .user, content: content, images: images, videos: videos)
+            Self(role: .user, content: content, images: images, videos: videos, audios: audios)
         }
 
         // wangqi modified 2026-03-10: Added toolCallId/name parameters to tool() so tool result messages
