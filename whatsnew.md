@@ -1,74 +1,99 @@
-# mlx-swift-lm: tag-20260425 → tag-20260522
+# mlx-swift-lm Upgrade: tag-20260425 → tag-20260607
 
-## Summary
+**Date:** 2026-06-07
+**Range:** `tag-20260425..tag-20260607` (56 commits)
+**Baseline previously integrated in app:** tag-20260522 (`08c940d`)
+**App integration point:** `ai/AIChatModelMLX.swift`, docs in `helper/docs/mlx-swift.md`
 
-12 commits merged from upstream `ml-explore/mlx-swift-lm` (including our local merge commit preserving `Gemma4FunctionParser` double-brace JSON fallback and a `Qwen3VL.swift` patch reconciling the new `state:` parameter from PR #283 with our existing chunked-prefill callback). This is primarily a **stability and Gemma 4 performance release** — no new model families, but a meaningful decode speedup, several crash fixes that hit iOS prefill paths, and a structural change to how M-RoPE positions are threaded through VLM forward passes.
-
----
-
-## New Features / Performance
-
-### Gemma 4 text decode: +23.8% throughput (PR #249)
-`Gemma4DecoderLayer` now fuses three op pairs (post-attention residual, post-MLP residual, PLE gating) into `compile()` helpers, reducing per-op MLX dispatch overhead. Measured **51.2 → 63.4 tok/s median on M4 Max**. Prefill and numerical output are unchanged. `rms_norm_eps` is hardcoded to `1e-6` with a `precondition` guard against future checkpoints diverging.
-
-### LLM generation benchmark helper (PR #248)
-`BenchmarkHelpers.benchmarkLLMGeneration` + `LLMGenerationStats` measure prefill (prompt processing) and decode (generation) throughput in one helper, mirroring the existing loading/tokenization helpers (warm-up + multi-run timing). `temperature=0` so runs are deterministic. Useful for evaluating fusion patches, custom kernels, or KV-cache tweaks without spinning up a separate CLI.
+This upgrade folds two upstream merges into our fork. The first (`0622987`/`08c940d`)
+brought the tag-20260522 audio/Gemma4/MoE work already documented in
+`LocalModelEngineInfo.mlxSwiftInfo`. The second merge (`3496df0`, this upgrade)
+brings the tag-20260607 delta on top of it, resolving six conflicts across our
+locally-patched tool-call and VLM-prefill files.
 
 ---
 
-## Bug Fixes (iOS-impacting)
+## New Capabilities
 
-### Gemma 4 attention crash when `vProj` is nil (PR #247)
-With `attentionKeqV=true`, `v_proj` does not exist and `v` shares `k`'s values. The previous code transposed `v = k` a second time after `k` had already been transposed to `(B, nKvHeads, L, head_dim)`, producing an incompatible shape and crashing in `broadcast_shapes`. Reproduces with `mlx-community/gemma-4-31b-it-4bit`. **Fix:** in the nil-`vProj` branch, apply `vNorm` directly to the already-transposed `k` and skip the extra transpose. The `vProj` branch is unchanged.
+- **Audio resources as model input (#298).** `UserInput` and `LMInput` now carry
+  audio alongside images and video; `Chat.Message` gains an `audios:` parameter
+  (default `[]`, non-breaking). Lays groundwork for audio-in VLM/omni models.
+- **Runtime LoRA toggle + PEFT adapter loader (#316).** Enable/disable LoRA at
+  runtime and load PEFT-format adapters without rebuilding the container.
+- **Structured ChatSession continuation (#313).** Resume a `ChatSession` with
+  structured state for multi-turn flows.
+- **ParoQuant pairwise-rotation quantization (#164).** Loads AutoAWQ-format
+  PARO-quantized models, applying pairwise Givens rotation at runtime via a Metal
+  kernel (`RotateQuantizedLinear`); rotation state derived once at load time and
+  thread-safe under concurrent inference. Adds a new on-device quantization format.
 
-### Gemma 4 VLM 1D-token-input prefill crash (PR #241)
-When callers construct `LMInput` directly (e.g. for manual KV-cache reuse), tokens arrive as 1D `(L,)` instead of 2D `(1, L)`. `processedPerLayerInputs` then became 3D and the 4D subscript on `finalPerLayerInputs` crashed in `mlx_array_dim`. The first request still succeeded because the autoregressive step adds `.newAxis`, but continuation requests crashed on initial prefill — a path our app hits on long sessions. **Fix:** expand 1D inputs / 2D `inputsEmbeds` to add a leading batch dim at the top of `callAsFunction` (zero-copy reshape).
+## VLM Correctness & Speed (iOS-relevant)
 
-### Gemma 4 vision pooler kernel derivation (PR #290)
-The pooler kernel was previously derived from the real patch count, which could yield `kernel=2` at the 280-token budget instead of the expected 3, causing real patches to map to **zero rows** in the einsum output (silently degraded VLM accuracy). **Fix:** new `gemma4VisionPoolingKernel(paddedPatchCount:outputLength:)` derives the kernel from `pooledHiddenStates.dim(1)`; regression tests added for all five budgets `{70, 140, 280, 560, 1120}`.
+- **Qwen2.5-VL MROPE / rope_deltas / invFreq fixes (#239, #238).** Matches Python
+  mlx-vlm parity; MROPE state now threaded through `LMOutput.State` for concurrent
+  session safety; vision-encoder attention mask is no longer ignored.
+- **SmolVLM2 small-image upscaling fix (#208/#255).** `tiles()` no longer upscales
+  images smaller than the processing budget — ~9x faster on small images (512×384:
+  1 patch/147 tokens instead of 13 patches/1140 tokens).
+- **Idefics3 SigLIP dtype fix (#296).** Vision encoder runs SigLIP in float32 rather
+  than bf16, fixing numerical drift.
+- **Qwen2-VL chat template (#242).** Emits vision tokens before text, matching the
+  reference template.
+- **Qwen3.5 VLM sanitize for bare `model.*` weight keys (#143/#254).**
 
-### Idefics3 prefill chunking (PR #297)
-`Idefics3.prepare()` now honors `windowSize` so prompt prefill is never chunked when it should be a single pass. The prior path could chunk and break long prompts on macOS; the fix also resolves a parallel issue in our Qwen3VL chunked-prefill (see merge notes).
+## Gemma 4 / MoE
+
+- **Gemma4 quantized KV-cache attention fix (#237).**
+- **Gemma4 per-layer model projection now quantizable (#309).**
+- **Optimized shared MoE combine paths (#324)** and **shared fused gated-delta
+  kernel between MLXLLM and MLXVLM (#32d51e5)**.
+- **Qwen3.5 float32 dtype consistency in `gatedDeltaUpdate` (#317).**
+
+## Tool Calling (iOS-relevant — local patch surface)
+
+- **Sporadic bare-JSON tool-call handling + hardened JSON parser recovery (#205).**
+  Upstream added `taggedStartMode`/bare-JSON paths and a `fallbackParser` in
+  `ToolCallProcessor`. Our merge integrates these with our `pendingOutput`
+  invisible-start-tag buffering and keeps the `XMLFunction` fallback in
+  `JSONToolCallParser`'s decode-failure branch (under upstream's declared-tool gate).
 
 ---
 
-## API / Structural Changes
+## Merge Conflict Resolutions (from `3496df0`)
 
-### `LMOutput.State`-based M-RoPE position passing (PR #283)
-**This is the load-bearing change for VLM models in this round.** Models no longer mutate state during eval. Instead, each forward returns the position-id state via `LMOutput.State`, and callers thread it back in on the next step. Affected here: `Qwen35`, `GlmOcr`, `Qwen3VL` (the latter required our local patch — see below). The autoregressive path uses `rope_deltas` to compute sequential positions; the prefill path computes positions from `getRopeIndex`. GPT-OSS was also synced with mlx-lm to ensure no sinks are missing.
+Six conflicts were resolved in files carrying our `// wangqi modified` patches:
 
-**Local patch applied (commit `1304cbc7`):** Our `Qwen3VL.swift` chunked-prefill loop now passes `state: nil` per chunk so each chunk's `callAsFunction` lazily computes (and caches into its own local `State` copy) M-RoPE positions. Chunks 2+ remain on the ropeDeltas-based autoregressive path. This reconciles PR #283's signature change with our existing chunked-prefill callback used to keep Qwen3VL prefill within iOS prefill budgets.
-
-### `GemmaFunctionParser` parameterized (PR #183) — merged with local override preserved
-Upstream's parameterized parser was adopted; our `Gemma4FunctionParser` double-brace JSON fallback is preserved on top.
-
----
-
-## Build / CI
-
-- Removed the SDK build-version probe from CI workflow — it was informative but caused install-time problems (PR #306).
-- CI docs check folded into the macOS build job to reuse a single runner (PR #286).
-
-Neither change affects the shipped library or our app build.
+1. `Chat.swift` — keep wangqi tool-call fields **and** upstream `audios`.
+2. `ToolCallProcessor.swift` — `pendingOutput` buffering + upstream
+   `taggedStartMode`/bareJSON + `fallbackParser`.
+3. `Evaluate.swift` — flush both `pendingOutput` and `processEOS` buffers at EOS.
+4. `JSONToolCallParser.swift` — XMLFunction fallback in decode-failure branch under
+   upstream's declared-tool gate.
+5. `Gemma4Text.swift` — adopt upstream's `kvState` enum.
+6. `Qwen25VL.swift` — keep iOS chunked prefill (`state` nil) alongside upstream's
+   MROPE state-seeding for non-iOS.
 
 ---
 
-## Risk Assessment for This Upgrade
+## Risk Assessment
 
-**Overall risk: Low–Medium.** The new code is mostly fixes the app benefits from directly; one structural change (PR #283) touched a code path we already patched.
+**Overall: MEDIUM.** The new capabilities (audio input, LoRA, ChatSession,
+ParoQuant) are additive and we do not yet call them, so they carry near-zero
+regression risk. The real exposure is in files we patch locally that upstream also
+rewrote in this range — all already conflict-resolved in `3496df0`, but each needs
+on-device verification.
 
-| Area | Risk | Notes |
-|------|------|-------|
-| Gemma 4 text generation | **Low** | Fused-`compile()` decode is a pure perf win; numerical output unchanged per upstream test; `rms_norm_eps` precondition will trip loudly if a divergent checkpoint ever ships. |
-| Gemma 4 31B VLM | **Low** | Fixes a crash we could have hit on 4-bit checkpoints; no behavior change for fp16 path. |
-| Qwen3VL chunked prefill | **Medium** | Local patch reconciles `state:` API with our chunked-prefill loop. State is recomputed per chunk (not shared), so chunks 2+ rely on ropeDeltas — correct under upstream semantics but worth eyeballing first-run on a fresh long-context VLM prompt on iOS. |
-| Qwen35 / GlmOcr | **Low–Medium** | PR #283 reshapes how positions move through `LMOutput`. Our app does not consume `LMOutput.State` externally, so the change is internally contained; first-load smoke test recommended on both models. |
-| Idefics3 | **Low** | We don't ship Idefics3 by default; if a user adds one, prefill is now correct. |
-| `BenchmarkHelpers` | **None** | Additive only; existing helpers unchanged. |
-| iOS memory / prefill | **Low** | No regressions identified. Gemma 4 VLM 1D-input fix removes one known crash path on continuation turns. |
+| Area | Risk | Why | Verify |
+|------|------|-----|--------|
+| Tool-call parsing (`ToolCallProcessor`, `JSONToolCallParser`, `Evaluate`) | **Medium-High** | Our `pendingOutput`/XML-fallback path was merged with upstream's new `taggedStartMode`/`fallbackParser`. Tool calling is core to the MLX workflow pipeline. | Run a tool-using MLX chat (e.g. web_search) end-to-end; confirm tool call is detected and emitted once. |
+| Qwen2.5-VL prepare/MROPE (`Qwen25VL.swift`) | **Medium** | Upstream rewrote MROPE/rope_deltas and now seeds state via `LMOutput.State`; we keep iOS chunked prefill with `state` nil. Risk of degraded image-token positions on iOS chunks 2+. | Long-prompt VLM run on iOS device (`MLXVLMLongPromptTests`), check image grounding, no Metal crash. |
+| Gemma4Text `kvState` enum | **Medium** | We adopted upstream's enum into our patched file; quantized KV-cache path also changed (#237). | Gemma-4 text + quantized KV generation on device. |
+| Idefics3 / Qwen3VL prefill | **Low-Medium** | Files changed upstream; our always-chunked Idefics3 and Qwen3VL chunked-prefill patches must remain intact. | Confirm `chunkedVLMPrefill` still invoked per `helper/docs/mlx-swift.md` checklist. |
+| `Chat.swift` audios field | **Low** | New param has a default; our tool-call fields preserved. Compile-only concern. | Build iOS + macOS targets. |
+| Numerical (MoE combine, gated-delta fp32, shared kernel) | **Low** | Precision/perf changes, no API surface change for our callers. | Spot-check Qwen3.5 / MoE model output coherence. |
 
-**Recommended smoke tests before shipping:**
-1. Gemma 4 4-bit text — confirm decode tok/s improvement and identical output to last build.
-2. Qwen3VL on iPad/iPhone — long image + text prompt that exceeds one prefill chunk; verify no position drift in the streamed reply.
-3. Qwen3.5 text — multi-turn continuation to confirm `LMOutput.State` plumbing.
-4. GlmOcr — single OCR turn on a sample image.
+**Recommended verification before release:**
+1. Build both `AIAssistant` (iOS) and `AIAssistantMac` schemes.
+2. Run `MLXVLMLongPromptTests` on a real device for the patched VLM models.
+3. Exercise one tool-calling MLX chat and one VLM image chat on device.
+4. Confirm `MLX.Memory.clearCache()` unload path is unaffected.
