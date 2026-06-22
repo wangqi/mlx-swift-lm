@@ -40,7 +40,11 @@ let package = Package(
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
-        .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+        // Lowered floor to 600.0.0 to overlap thirdparty/swift-json-schema's 509..<601
+        // swift-syntax range; upstream PR #340's 602 floor is disjoint and breaks app
+        // dependency resolution. 600.x still compiles (from source), per PR #340's own note.
+        // wangqi modified 2026-06-21
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
     ],
     targets: [
         .target(
