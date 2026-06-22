@@ -36,7 +36,12 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        // Self-managed local fork carrying the PrismML 1-bit/2-bit affine quantization
+        // patch (thirdparty/mlx-swift -> wangqi/mlx-swift); taken out of SwiftPM GitHub
+        // resolution. The app's root-level XCLocalSwiftPackageReference override pins the
+        // same path for mlx-audio-swift too. See helper/docs/mlx-swift.md.
+        // wangqi modified 2026-06-22
+        .package(path: "../mlx-swift"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
