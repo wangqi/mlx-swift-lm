@@ -3,7 +3,7 @@
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
 starting from. Update this file on every upgrade (it is part of the `mlx-swift-lm-upgrade` skill's deliverables).
 
-**Last updated:** 2026-06-22
+**Last updated:** 2026-07-03
 
 > These three are **independent local git repos** under `thirdparty/` (not app submodules). The app
 > (`AIAssistant.xcodeproj`) wires them as local SwiftPM packages; a root-level `XCLocalSwiftPackageReference` for
@@ -16,12 +16,12 @@ starting from. Update this file on every upgrade (it is part of the `mlx-swift-l
 
 | Repo | Remote (origin) | Branch | HEAD | Role |
 |------|-----------------|--------|------|------|
-| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20260621` | `a53f021` | LLM/VLM layer (the package upgraded every 7-10 days) |
+| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20260703` | `b3c92bf` | LLM/VLM layer (the package upgraded every 7-10 days) |
 | `thirdparty/mlx-swift`    | `wangqi/mlx-swift`    | `prism-1bit-0.31.4` | `5e97310` | Swift API + vendored mlx-core; carries the PrismML patch |
 | `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`) | `prism-1bit-0.31.1` | `48db7fe5` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
 
 ### Engine version surfaced in the app
-- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20260621"` (`views/settings/models/LocalModelAboutView.swift`).
+- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20260703"` (`views/settings/models/LocalModelAboutView.swift`).
 
 ---
 
@@ -100,6 +100,7 @@ Last full run: 2026-06-22 — iOS + macOS BUILD SUCCEEDED; QuantizationTests TES
 | Date | mlx-swift-lm | mlx-swift (Swift / core) | Patch action |
 |------|--------------|--------------------------|--------------|
 | 2026-06-22 | `tag-20260621` | `0.31.4` (`dc43e62`) / `0.31.1` (`ce45c52`) | Initial self-managed-fork setup; PrismML 1-bit/2-bit patch applied; no version move from the previous `tag-20260616→tag-20260621` merge |
+| 2026-07-03 | `tag-20260703` | `0.31.4` (`dc43e62`) / `0.31.1` (`ce45c52`) | No version move — PrismML patch unaffected. Merge resolved the Qwen2-VL M-RoPE (#345) vs. iOS chunked-prefill overlap (hybrid split: image path single-shot, text-only chunked); all 7 VLM `chunkedVLMPrefill` patches preserved. iOS scheme BUILD SUCCEEDED; macOS + QuantizationTests not re-run (patch base untouched) |
 
 ---
 
