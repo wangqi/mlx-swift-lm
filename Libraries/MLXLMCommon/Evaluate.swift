@@ -72,6 +72,11 @@ public struct GenerateParameters: Sendable {
     /// Step to begin using a quantized KV cache when kvBits is non-nil (default: 0)
     public var quantizedKVStart: Int
 
+    /// KV cache compression scheme. Overrides kvBits when set.
+    /// Built-in: "affine4", "affine8" (equivalent to kvBits 4/8).
+    /// Extensible for custom schemes (e.g. WHT-based compression).
+    public var kvScheme: String?
+
     /// Sampling temperature
     public var temperature: Float
 
@@ -83,6 +88,13 @@ public struct GenerateParameters: Sendable {
 
     /// Min-p sampling threshold relative to the highest probability token (0 disables)
     public var minP: Float
+
+    /// Optional seed for reproducible sampling. When set, the sampler's RNG
+    /// (`TopPSampler` / `CategoricalSampler`) is seeded deterministically, so
+    /// the same `(seed, prompt, parameters)` produces the same sampled
+    /// tokens. `nil` ⇒ the sampler is seeded from system entropy (the prior
+    /// default). Inert at `temperature == 0` (argmax has no RNG).
+    public var seed: UInt64?
 
     /// Penalty factor for repeating tokens
     public var repetitionPenalty: Float?
@@ -108,6 +120,7 @@ public struct GenerateParameters: Sendable {
         kvBits: Int? = nil,
         kvGroupSize: Int = 64,
         quantizedKVStart: Int = 0,
+        kvScheme: String? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -118,13 +131,15 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        seed: UInt64? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
+        self.kvScheme = kvScheme
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -136,6 +151,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.seed = seed
     }
 
     public func sampler() -> LogitSampler {
@@ -146,9 +162,10 @@ public struct GenerateParameters: Sendable {
         if temperature == 0 {
             return ArgMaxSampler()
         } else if usesTopP || usesTopK || usesMinP {
-            return TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP)
+            return TopPSampler(
+                temperature: temperature, topP: topP, topK: topK, minP: minP, seed: seed)
         } else {
-            return CategoricalSampler(temperature: temperature)
+            return CategoricalSampler(temperature: temperature, seed: seed)
         }
     }
 
@@ -219,7 +236,10 @@ public struct TopPSampler: LogitSampler {
     let negInf: MLXArray
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0) {
+    public init(
+        temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0,
+        seed: UInt64? = nil
+    ) {
         self.temp = MLXArray(temperature)
         if topP > 0 && topP < 1 {
             self.topP = MLXArray(topP)
@@ -229,7 +249,9 @@ public struct TopPSampler: LogitSampler {
         self.topK = topK > 0 ? topK : nil
         self.minP = minP > 0 ? MLXArray(minP) : nil
         self.negInf = MLXArray(-Float.infinity)
-        self.randomState = MLXRandom.RandomState()
+        // A seed makes sampling reproducible; nil keeps the prior
+        // entropy-seeded behavior.
+        self.randomState = seed.map { MLXRandom.RandomState(seed: $0) } ?? MLXRandom.RandomState()
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
@@ -295,9 +317,11 @@ public struct CategoricalSampler: LogitSampler {
     let temp: MLXArray
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float) {
+    public init(temperature: Float, seed: UInt64? = nil) {
         self.temp = MLXArray(temperature)
-        self.randomState = MLXRandom.RandomState()
+        // A seed makes sampling reproducible; nil keeps the prior
+        // entropy-seeded behavior.
+        self.randomState = seed.map { MLXRandom.RandomState(seed: $0) } ?? MLXRandom.RandomState()
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
@@ -544,6 +568,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvBits: Int?
     let kvGroupSize: Int
     let quantizedKVStart: Int
+    let kvScheme: String?
 
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
@@ -572,6 +597,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -605,6 +631,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -638,6 +665,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.kvScheme = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -693,7 +721,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme
         )
 
         return convertToToken(logits: result.logits)
@@ -1480,6 +1509,7 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
             format: context.configuration.toolCallFormat ?? .json
         )
     )
@@ -1546,6 +1576,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
+            stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
             tools: tools,
             fallbackParser: fallbackToolCallParser
@@ -1686,6 +1717,7 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
             format: context.configuration.toolCallFormat ?? .json
         )
     )
@@ -1828,7 +1860,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            while let token = iterator.next() {
+            tokenLoop: while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -1845,9 +1877,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
                     if includeStopToken {
                         tokenCount += 1
-                        if !handler.onStopToken(token, emit: continuation.yield) {
-                            stopReason = .cancelled
+                        switch handler.onStopToken(token, emit: continuation.yield) {
+                        case .more:
                             break
+                        case .stop:
+                            stopReason = .stop
+                            break tokenLoop
+                        case .cancelled:
+                            stopReason = .cancelled
+                            break tokenLoop
                         }
                     } else {
                         iterator.discardGeneratedToken()
@@ -1857,9 +1895,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
 
                 tokenCount += 1
-                if !handler.onToken(token, emit: continuation.yield) {
-                    stopReason = .cancelled
+                switch handler.onToken(token, emit: continuation.yield) {
+                case .more:
                     break
+                case .stop:
+                    stopReason = .stop
+                    break tokenLoop
+                case .cancelled:
+                    stopReason = .cancelled
+                    break tokenLoop
                 }
             }
 
@@ -2105,20 +2149,26 @@ public enum TokenGeneration: Sendable {
 
 // MARK: - TokenLoopHandlers
 
+private enum TokenLoopDisposition {
+    case more
+    case stop
+    case cancelled
+}
+
 private protocol TokenLoopHandler {
     associatedtype Output
 
-    /// Return false to stop the loop early.
+    /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
     mutating func onToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> Bool
+    ) -> TokenLoopDisposition
 
     /// Called only when includeStopToken == true and a stop token was hit.
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> Bool
+    ) -> TokenLoopDisposition
 
     /// Called after the token loop finishes, before the info event.
     mutating func onGenerationEnd(
@@ -2128,56 +2178,152 @@ private protocol TokenLoopHandler {
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
 }
 
+struct StopStringFilter {
+    let stopStrings: [String]
+    var buffer = ""
+    var stopped = false
+
+    init(stopStrings: Set<String>) {
+        self.stopStrings = stopStrings.filter { !$0.isEmpty }.sorted {
+            if $0.count == $1.count {
+                return $0 < $1
+            }
+            return $0.count > $1.count
+        }
+    }
+
+    var isEnabled: Bool {
+        !stopStrings.isEmpty
+    }
+
+    mutating func process(_ chunk: String) -> (text: String?, stopped: Bool) {
+        guard !stopped else {
+            return (nil, true)
+        }
+        guard isEnabled else {
+            return (chunk.isEmpty ? nil : chunk, false)
+        }
+
+        buffer += chunk
+
+        if let stopRange = earliestStopRange(in: buffer) {
+            let text = String(buffer[..<stopRange.lowerBound])
+            buffer = ""
+            stopped = true
+            return (text.isEmpty ? nil : text, true)
+        }
+
+        let suffixLength = longestStopPrefixSuffixLength(in: buffer)
+        let emitEnd = buffer.index(buffer.endIndex, offsetBy: -suffixLength)
+        let text = String(buffer[..<emitEnd])
+        buffer = String(buffer[emitEnd...])
+        return (text.isEmpty ? nil : text, false)
+    }
+
+    mutating func finish() -> String? {
+        guard isEnabled, !stopped, !buffer.isEmpty else {
+            return nil
+        }
+        let text = buffer
+        buffer = ""
+        return text
+    }
+
+    private func earliestStopRange(in text: String) -> Range<String.Index>? {
+        var earliest: Range<String.Index>?
+        for stopString in stopStrings {
+            guard let range = text.range(of: stopString) else {
+                continue
+            }
+            if let current = earliest {
+                if range.lowerBound < current.lowerBound {
+                    earliest = range
+                }
+            } else {
+                earliest = range
+            }
+        }
+        return earliest
+    }
+
+    private func longestStopPrefixSuffixLength(in text: String) -> Int {
+        var longest = 0
+        for stopString in stopStrings {
+            let maxLength = Swift.min(text.count, stopString.count - 1)
+            guard maxLength > longest else {
+                continue
+            }
+            for length in stride(from: maxLength, through: longest + 1, by: -1) {
+                if text.suffix(length) == stopString.prefix(length) {
+                    longest = length
+                    break
+                }
+            }
+        }
+        return longest
+    }
+}
+
 private struct TextToolTokenLoopHandler: TokenLoopHandler {
     typealias Output = Generation
 
     var detokenizer: NaiveStreamingDetokenizer
+    var stopStringFilter: StopStringFilter
     let toolCallProcessor: ToolCallProcessor
 
-    // wangqi modified 2026-03-10: added fallbackParser
-    init(tokenizer: Tokenizer, format: ToolCallFormat, tools: [[String: any Sendable]]? = nil, fallbackParser: (any ToolCallParser)? = nil) {
+    // wangqi modified 2026-03-10: added fallbackParser (merged with upstream stopStrings 2026-07-03)
+    init(
+        tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
+        tools: [[String: any Sendable]]? = nil, fallbackParser: (any ToolCallParser)? = nil
+    ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        stopStringFilter = StopStringFilter(stopStrings: stopStrings)
         toolCallProcessor = ToolCallProcessor(format: format, tools: tools, fallbackParser: fallbackParser)
     }
 
     mutating func onToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
+    ) -> TokenLoopDisposition {
         detokenizer.append(token: token)
         if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
+            let result = stopStringFilter.process(chunk)
+            if let text = result.text {
+                let disposition = processText(text, emit: emit)
+                if case .more = disposition {
+                } else {
+                    return disposition
                 }
             }
-
-            // Emit all complete tool calls in parse order.
-            for toolCall in toolCallProcessor.drainToolCalls() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
+            if result.stopped {
+                return .stop
             }
         }
 
-        return true
+        return .more
     }
 
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
-        true
+    ) -> TokenLoopDisposition {
+        .more
     }
 
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
-        // wangqi modified 2026-04-13: flush any text buffered in pendingOutput before EOS parsing.
-        // In normal (non-tool-call) generations, pendingOutput may hold the last few tokens that
-        // arrived without a newline and were not yet flushed by processTaggedChunk. This is a
-        // separate buffer from toolCallBuffer, which processEOS drains below.
+        // Merged 2026-07-03: first drain the stop-string filter tail through processText (upstream),
+        // then flush any text buffered in toolCallProcessor.pendingOutput before EOS parsing (fork).
+        // These are separate buffers; toolCallBuffer is drained by processEOS below.
+        if let text = stopStringFilter.finish() {
+            guard case .more = processText(text, emit: emit) else {
+                return
+            }
+        }
+
+        // wangqi modified 2026-04-13: In normal (non-tool-call) generations, pendingOutput may hold the
+        // last few tokens that arrived without a newline and were not yet flushed by processTaggedChunk.
         if let text = toolCallProcessor.flushPendingOutput() {
             if case .terminated = emit(.chunk(text)) {
                 return
@@ -2202,6 +2348,29 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
         .info(info)
     }
+
+    private mutating func processText(
+        _ text: String,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> TokenLoopDisposition {
+        guard !text.isEmpty else {
+            return .more
+        }
+
+        if let textToYield = toolCallProcessor.processChunk(text) {
+            if case .terminated = emit(.chunk(textToYield)) {
+                return .cancelled
+            }
+        }
+
+        for toolCall in toolCallProcessor.drainToolCalls() {
+            if case .terminated = emit(.toolCall(toolCall)) {
+                return .cancelled
+            }
+        }
+
+        return .more
+    }
 }
 
 private struct RawTokenLoopHandler: TokenLoopHandler {
@@ -2210,21 +2379,21 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
     mutating func onToken(
         _ token: Int,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> Bool {
+    ) -> TokenLoopDisposition {
         if case .terminated = emit(.token(token)) {
-            return false
+            return .cancelled
         }
-        return true
+        return .more
     }
 
     mutating func onStopToken(
         _ token: Int,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> Bool {
+    ) -> TokenLoopDisposition {
         if case .terminated = emit(.token(token)) {
-            return false
+            return .cancelled
         }
-        return true
+        return .more
     }
 
     mutating func onGenerationEnd(

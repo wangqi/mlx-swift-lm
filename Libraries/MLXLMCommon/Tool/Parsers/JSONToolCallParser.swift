@@ -31,11 +31,12 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         guard
             let data = jsonStr.data(using: .utf8),
-            let normalizedData = normalizedToolCallData(from: data),
-            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: normalizedData)
+            let toolCall = parseToolCall(from: data)
         else {
-            // wangqi modified 2026-03-10: Fallback to XMLFunction format for models (e.g. Qwen3.5-2B)
-            // that generate <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
+            // wangqi modified 2026-03-10 (merged 2026-07-03): Fall back to XMLFunction format for models
+            // (e.g. Qwen3.5-2B) that generate <function=name><parameter=key>value</parameter></function>
+            // inside <tool_call> tags. Upstream's parseToolCall(from:) supersedes the fork's old
+            // normalizedToolCallData helper (it also handles id + nested function + stringified args).
             return XMLFunctionParser().parse(content: content, tools: tools)
         }
 
@@ -44,7 +45,7 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             var isDeclaredTool = false
             for tool in tools {
                 let functionSpec = tool["function"] as? [String: any Sendable]
-                if functionSpec?["name"] as? String == function.name {
+                if functionSpec?["name"] as? String == toolCall.function.name {
                     isDeclaredTool = true
                     break
                 }
@@ -55,13 +56,19 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             }
         }
 
-        return ToolCall(function: function)
+        return toolCall
     }
 
-    private func normalizedToolCallData(from data: Data) -> Data? {
+    private func parseToolCall(from data: Data) -> ToolCall? {
         guard var jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return nil
+        }
+
+        var id = jsonObject["id"] as? String
+        if let functionObject = jsonObject["function"] as? [String: Any] {
+            id = id ?? functionObject["id"] as? String
+            jsonObject = functionObject
         }
 
         if let stringifiedArguments = jsonObject["arguments"] as? String {
@@ -73,6 +80,11 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             jsonObject["arguments"] = argumentsObject
         }
 
-        return try? JSONSerialization.data(withJSONObject: jsonObject)
+        guard
+            let normalizedData = try? JSONSerialization.data(withJSONObject: jsonObject),
+            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: normalizedData)
+        else { return nil }
+
+        return ToolCall(function: function, id: id)
     }
 }

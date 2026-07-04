@@ -777,7 +777,8 @@ public final class ChatSession {
                         {
                             for toolCall in pendingToolCalls {
                                 let toolResult = try await toolDispatch(toolCall)
-                                messages.append(.tool(toolResult))
+                                // Merge note 2026-07-03: fork Chat.Message.tool uses toolCallId: (not id:)
+                                messages.append(.tool(toolResult, toolCallId: toolCall.id))
                             }
                             continue restart
                         }

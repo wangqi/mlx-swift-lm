@@ -210,6 +210,12 @@ public class UserInputTests: XCTestCase {
         assertEqual(expected, messages)
     }
 
+    // Merge note 2026-07-03: upstream's testCustomMessageGeneratorsPreserveToolMetadata (#360) was
+    // removed. It constructs assistant tool calls from [ToolCall] and asserts the type/function/id
+    // envelope that upstream's addToolMetadata builds. This fork keeps its dict-based Chat.Message
+    // tool fields and passes toolCalls through verbatim (see MLXLMCommon/Chat.swift addToolMetadata),
+    // so the upstream test does not apply.
+
     // MARK: - Qwen2 Message Generator Tests
 
     public func testQwen2ConversionImage() {

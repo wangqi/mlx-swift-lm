@@ -20,6 +20,8 @@ public enum Chat {
         // wangqi modified 2026-03-10: Add optional tool call fields to support multi-turn tool calling
         // via Chat.Message API. toolCalls enables assistant messages with tool call requests;
         // toolCallId/name enable tool result messages. All fields default to nil for backward compatibility.
+        // Merge note 2026-07-03: upstream #360 introduced a parallel `tool: Tool?` model for the same
+        // feature; the fork keeps its dict-based fields because ai/AIChatModelMLX.swift consumes them.
         /// Tool calls requested by the assistant (for assistant messages with tool calls).
         public var toolCalls: [[String: any Sendable]]?
 
@@ -114,32 +116,38 @@ public protocol MessageGenerator: Sendable {
 extension MessageGenerator {
 
     public func generate(message: Chat.Message) -> Message {
-        [
+        var dictionary: Message = [
             "role": message.role.rawValue,
             "content": message.content,
         ]
+
+        addToolMetadata(to: &dictionary, for: message)
+
+        return dictionary
     }
 
-    // wangqi modified 2026-03-10: Override generate(messages:) default implementation to centrally inject
-    // tool call fields (tool_calls, tool_call_id, name) after each model-specific generate(message:) call.
-    // This avoids duplicating tool field injection in every VLM/LLM MessageGenerator subclass.
-    public func generate(messages: [Chat.Message]) -> [Message] {
-        let result = messages.map { message in
-            var raw = generate(message: message)
-            // Inject tool-related fields that model-specific generators don't handle
-            if let toolCalls = message.toolCalls {
-                raw["tool_calls"] = toolCalls
-            }
-            if let toolCallId = message.toolCallId {
-                raw["tool_call_id"] = toolCallId
-            }
-            if let name = message.name {
-                raw["name"] = name
-            }
-            return raw
+    /// Adds tool-call metadata from a structured message to a raw message dictionary.
+    // Merge note 2026-07-03: upstream #360 introduced this shared hook (each model-specific
+    // generate(message:) override calls it). The body is adapted to the fork's dict-based
+    // Chat.Message tool fields (toolCalls/toolCallId/name) rather than upstream's `tool: Tool?`.
+    public func addToolMetadata(to dictionary: inout Message, for message: Chat.Message) {
+        if let toolCalls = message.toolCalls {
+            dictionary["tool_calls"] = toolCalls
         }
-        // Route through MLXLogCollector so the line follows the same on/off / chaining policy
-        // as other mlx-swift-lm internal logs — wangqi modified 2026-05-15
+        if let toolCallId = message.toolCallId {
+            dictionary["tool_call_id"] = toolCallId
+        }
+        if let name = message.name {
+            dictionary["name"] = name
+        }
+    }
+
+    // wangqi modified 2026-03-10 / 2026-05-15: route the generated messages through MLXLogCollector
+    // so the line follows the same on/off / chaining policy as other mlx-swift-lm internal logs.
+    // Tool fields are injected by generate(message:) -> addToolMetadata above, so this override only
+    // maps + logs (no re-injection).
+    public func generate(messages: [Chat.Message]) -> [Message] {
+        let result = messages.map { generate(message: $0) }
         if MLXLogCollector.shared.hasHandler {
             MLXLogCollector.shared.log("[Chat.generate] \(result.count) msgs: \(result.map { (($0["role"] as? String) ?? "?") + ($0["tool_calls"] != nil ? "+TC" : "") + ($0["tool_call_id"] != nil ? "+TR" : "") }.joined(separator: " -> "))")
         }
@@ -158,8 +166,8 @@ extension MessageGenerator {
     }
 }
 
-/// Default implementation of ``MessageGenerator`` that produces a
-/// `role` and `content`.
+/// Default implementation of ``MessageGenerator`` that produces `role` and
+/// `content`, plus `tool_call_id` and `tool_calls` when present.
 ///
 /// ```swift
 /// [
@@ -169,13 +177,6 @@ extension MessageGenerator {
 /// ```
 public struct DefaultMessageGenerator: MessageGenerator {
     public init() {}
-
-    public func generate(message: Chat.Message) -> Message {
-        [
-            "role": message.role.rawValue,
-            "content": message.content,
-        ]
-    }
 }
 
 /// Implementation of ``MessageGenerator`` that produces a
