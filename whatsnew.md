@@ -1,119 +1,103 @@
-# mlx-swift-lm Upgrade — `tag-20260621` → `tag-20260703`
+# mlx-swift-lm Upgrade — tag-20260703 → tag-20260714
 
-**Merged:** 2026-07-03
-**Upstream base:** `ml-explore/mlx-swift-lm` main (PRs #230, #330, #342, #345, #360, #363, #365, #366, #368, #371, #372, #373, #377, #378, #380, #385)
-**Local integration doc:** `helper/docs/mlx-swift.md`
-**Primary consumer:** `ai/AIChatModelMLX.swift`
+**Range:** `tag-20260703..tag-20260714`
+**Date:** 2026-07-14
+**Upstream:** ml-explore/mlx-swift-lm (merged into fork `main`)
 
-16 upstream PRs (17 commits incl. merge). For our iOS integration the headline is upstream PR #345, which
-implements 3-D multimodal RoPE (M-RoPE) inside the **Qwen2-VL** language model — the same file that carries our
-fork-local iOS `chunkedVLMPrefill` patch. The overlap was resolved during the merge with a hybrid split: the
-text-only path stays chunked on iOS/Catalyst (M-RoPE positions are `nil` there), while the image/video path —
-which now carries M-RoPE spatial positions that cannot be sliced per chunk — falls through to single-shot prefill
-on every platform. No mlx-swift / mlx-core version move, so the PrismML low-bit patch is untouched.
+This upgrade is dominated by **model-correctness fixes** for the VLM (vision) and
+Gemma families plus one significant **Apple Silicon prefill speedup**. There are
+no breaking API changes to how the app loads or runs models; the only signature
+change (`prefillStepSize` becoming optional) is source-compatible with our call site.
 
 ---
 
-## Highlights
+## Highlights for iOS / Apple Silicon
 
-### On-device / iOS memory & stability
-- **Qwen2-VL M-RoPE (#345)** now runs through the language model, so image tokens get true 3-D spatial positions
-  and bounding-box / layout tasks stop drifting with generation length. On iOS the image path is single-shot
-  (short image prompts); the long text-only path keeps our chunked prefill. Our `chunkedVLMPrefill` patch count is
-  unchanged across all 7 touched VLM files.
-- **Extensible KV-cache compression (#230)** — `GenerateParameters.kvScheme` (string) selects a KV compression
-  strategy (`"affine4"`/`"affine8"` built in) and **overrides `kvBits` when set**. `nil` preserves our current
-  iOS behavior (`kvBits = 4`, `quantizedKVStart = 64`); no code change needed to keep today's memory profile.
-- **Runtime stop-string handling (#372)** — generation can halt on arbitrary stop strings, correctly spanning
-  token-chunk boundaries. Opt-in; empty stop set preserves current behavior.
+### Performance
 
-### New models
-- **Mixtral (#378)** — sparse MoE LLM (Mistral-style GQA attention + top-k SwitchGLU experts), registered as
-  `"mixtral"`. Loads both full-precision and pre-quantized checkpoints.
-- **Mamba2 (#380)** — first pure state-space-model LLM (no attention KV cache; per-layer `MambaCache`),
-  registered as `"mamba2"`.
-- **LFM2.5 bidirectional embedders (#365)** — LFM2.5-Embedding-350M (CLS-pooled dense) and LFM2.5-ColBERT-350M
-  (late-interaction) added to `MLXEmbedders`, `model_type "lfm2"`.
+- **Gemma 3 prompt prefill up to 2.6x faster (#346).** `Gemma3TextModel.prepare`
+  now prefills all-but-the-last prompt token through the inner model (KV-cache only,
+  **skipping the 262k-vocabulary `lm_head`**) and hands only the final token to the
+  token iterator. Measured on `translategemma-4b-it-4bit` (577-token prompt, greedy):
+  prefill 177 → 463 tok/s, 3253 → 1246 ms, **byte-identical output**. The chunk size
+  honors an explicit `GenerateParameters.prefillStepSize` and otherwise defaults to
+  128 (tuned for asyncEval CPU/GPU pipelining on Apple Silicon).
 
-### New capabilities / API
-- **Reproducible sampling seed (#377)** — `GenerateParameters.seed: UInt64?` threads a per-request seed into each
-  sampler's `RandomState`; `nil` keeps the existing entropy seed. Per-request, so concurrency-safe (no shared RNG).
-- **Correlated tool-call transcripts (#360)** — optional `ToolCall.id` plus OpenAI-style `tool_calls` /
-  `tool_call_id` metadata, wired through all six VLM generators. Lets assistant tool calls and tool results be
-  paired across turns; relevant to `AIChatModelMLX` tool handling and `MCPToolIntegration2`.
+### Vision-Language (VLM) correctness
 
-### Correctness fixes
-- **Gemma 4 loading (#330, #342, #363, #366)** — KV-shared layers own no `k_proj`/`v_proj`/`k_norm`; QAT and some
-  PTQ checkpoints prune (or, for the 12B unified model, add `vision_embedder`) those tensors. Sanitize now drops
-  the redundant/extra weights on both the LLM and VLM text backbones, fixing `keyNotFound` / "unhandled keys"
-  load failures (e.g. `gemma-4-E2B-it-qat-4bit`, `gemma4_unified` 12B).
-- **Gemma 4 VLM end-token defaults (#373).**
-- **Falcon-H1R correctness, cache, and preset fixes (#368).**
-- **RoPE config validation (#371)** — invalid RoPE configurations are rejected up front instead of producing
-  silently wrong positions.
+- **Qwen3-VL dark/low-contrast images now readable (#411).** The image preprocess
+  path was feeding the ViT linear-light values instead of gamma-encoded sRGB. Near-black
+  text on a dark background reached the model with ~12x less contrast than the HF
+  reference and was unreadable. The sRGB tone curve is now applied (matching the
+  sibling video path and Qwen2.5-VL/Qwen2-VL).
+- **Qwen3.5-VL garbage output fixed (#403).** `Qwen35.sanitize` (VLM) applied the
+  RMSNorm `+1` offset unconditionally; on pre-converted MLX checkpoints this
+  double-shifted every layernorm and produced garbage tokens. The VLM path now
+  gates the shift exactly like the LLM path.
+- **Qwen2.5-VL position drift fixed (#419).** The prefill `LMOutput.State`
+  (MROPE positionIds / ropeDeltas) was dropped on the `TokenIterator` `.logits`
+  path, so the first decode step ran without them — position drift after an image
+  block and degenerate empty output on dense frames. The standard path now carries
+  the state like the `.tokens` and speculative paths.
+- **Gemma 4 VLM load fixed (#390).** KV-shared tail layers were built with
+  `kvSharedOnly: false`, declaring `k_proj`/`v_proj` they don't own and causing
+  strict-loader `keyNotFound` failures on real checkpoints (e.g. `gemma-4-e4b-it-4bit`).
+  Init now uses the same KV-shared predicate as the rest of the stack.
 
-### Build / toolchain
-- `.swift-format` sets `indentConditionalCompilationBlocks = false` (#385) — cosmetic; aligns `#if/#else/#endif`
-  bodies with the directive. No source semantics.
+### Tool calling
 
-### Tests
-- Upstream added `MixtralTests`, `Mamba2Tests` (no model download), LFM2.5 embedder parity tests, RoPE-validation
-  positive-path tests, and seed determinism/divergence tests. Our fork-local
-  `testcases/ai/mlx/MLXVLMLongPromptTests.swift` and `thirdparty/mlx-swift/Tests/MLXTests/QuantizationTests.swift`
-  are unaffected by the merge.
+- **Gemma tool arguments coerced by schema type (#388).** `GemmaFunctionParser`
+  was missing the `convertParameterValue` calls, so every tool-call argument was
+  passed as a string instead of its declared type. Arguments are now converted to
+  the types the tools expect.
 
----
+### Model loading
 
-## iOS / On-Device Impact Summary
-
-| Area | Effect on iOS |
-|------|---------------|
-| VLM prefill (Qwen2-VL) | M-RoPE now in the LM; image path single-shot, text-only path stays chunked (#345) |
-| KV cache | New `kvScheme` string param; overrides `kvBits` only when set — `nil` keeps today's iOS profile (#230) |
-| Generation loop | Runtime stop-string support across chunk boundaries; opt-in (#372) |
-| Sampling | Optional per-request `seed` for reproducibility; `nil` = current entropy behavior (#377) |
-| Tool calling | Correlated tool-call IDs / OpenAI-style metadata through all VLM generators (#360) |
-| Model loading | Gemma 4 QAT/PTQ/12B-unified load fixes (#330, #342, #363, #366) |
-| Low-bit quant | No mlx-swift/mlx-core version move — PrismML 1-bit/2-bit patch unaffected |
+- **Honor safetensors index when loading weights (#408).** `loadWeights` now reads
+  `model.safetensors.index.json` (via the new `safetensorWeightURLs` helper) and
+  loads only the referenced shards when an index is present, falling back to
+  enumerating all `.safetensors`. *(Merge conflict in this file resolved on our side:
+  upstream's index-honoring loop was adopted and the fork's nil-enumerator crash-guard
+  — `ModelLoadError.directoryNotAccessible` — was preserved by moving it into the new
+  helper's fallback, replacing upstream's reintroduced force-unwrap.)*
 
 ---
 
-## Risk Assessment — **3 identified risks** (1 medium, 2 low)
+## Changes with no effect on this app
 
-### R1 — Qwen2-VL M-RoPE overlaps the iOS chunked-prefill patch (MEDIUM)
-Upstream PR #345 added 3-D M-RoPE inside `Qwen2VL.swift`, the same `prepare(_:cache:windowSize:)` that carries
-our `chunkedVLMPrefill` patch. The merge resolved this with a hybrid split (comment
-`wangqi modified 2026-07-03 (hybrid chunk merge)`): the **text-only** path (`allPixels == nil`, `positionIds ==
-nil`) stays chunked on iOS/Catalyst using cache-offset sequential RoPE; the **image/video** path carries M-RoPE
-`positionIds` `[3, batch, seq]` and goes single-shot because chunking without slicing `positionIds` in lockstep
-would feed wrong spatial positions. The old/new `chunkedVLMPrefill` counts match across all 7 touched VLM files
-(FastVLM, Gemma4, GlmOcr, Mistral3, Qwen25VL, Qwen2VL, Qwen3VL), so no patch was dropped.
-*Verify:* run `testcases/ai/mlx/MLXVLMLongPromptTests.swift` (Qwen2-VL) on device; confirm a long text-only VLM
-prompt still generates without the `[1, h, N, N]` Metal abort, and that an image prompt with layout/bounding-box
-output is spatially correct. Regression coverage: `MLXVLMLongPromptTests.swift`.
+These are real upstream fixes but touch code paths the app does not use:
 
-### R2 — `kvScheme` overrides `kvBits` when set (LOW)
-`GenerateParameters.kvScheme` (#230) supersedes `kvBits` whenever it is non-nil. Our iOS KV path sets `kvBits = 4`
-and never sets `kvScheme`, so the default `nil` preserves current behavior. Risk is only if a future config path
-starts populating `kvScheme` and silently disables the 4-bit KV cap that keeps iOS under the jetsam limit.
-*Verify:* confirm no code sets `GenerateParameters.kvScheme`; keep the iOS `kvBits = 4` / `quantizedKVStart = 64`
-path as the source of truth.
-
-### R3 — New Mamba2 / Mixtral models are not memory-verified on iOS (LOW)
-Mamba2 (pure SSM) and Mixtral (sparse MoE) are new LLM architectures. Neither overrides
-`prepare(_:cache:windowSize:)` nor is a VLM, so the chunked-prefill crash surface does not apply. Mamba2 uses its
-own `MambaCache` (no attention KV), which the iOS `kvBits` path does not touch. They are not surfaced in
-`models_*.json` yet, so there is no user-facing exposure until deliberately added.
-*Verify:* if either is later added to `helper/models_*.json`, run a device memory check before shipping.
+- **ChatSession consumer-cancellation deadlock fix (#413).** We do not use
+  `MLXLMCommon.ChatSession`; the app runs its own generation loop and cancellation
+  via `generationChatSessionId`.
+- **Qwen3 embedder attentionMask fix (#418).** We embed via CoreML
+  (`CoreMLTextEmbedder` / `EmbeddingModelManager`), not `MLXEmbedders`.
+- **CI / lint only:** pin swift-format 603.0.0 (#386, #416), and fix
+  `mac_build_and_test` for mlx-swift ≥ 0.31.5 via `-skipPackagePluginValidation`
+  plus swift-format 603 conformance (#404). Dev-tooling only, no shipped code.
 
 ---
 
-## Follow-ups
-1. Build both schemes: `AIAssistant` iOS **BUILD SUCCEEDED (2026-07-03)**; `AIAssistantMac` still to run.
-2. Run `testcases/ai/mlx/MLXVLMLongPromptTests.swift` on device for R1 (Qwen2-VL text-only long prompt + image
-   bounding-box correctness).
-3. No new VLM model files added, so the patched-models list in `helper/docs/mlx-swift.md` is unchanged. Mamba2 /
-   Mixtral / LFM2.5 embedders remain un-surfaced until added to `models_*.json`; decide separately whether to
-   expose them.
-4. Version axes unchanged (`mlx-swift 0.31.4` / `mlx-core 0.31.1`) — no PrismML re-apply; QuantizationTests gate
-   not re-run (patch base untouched).
+## Risk Evaluation
+
+**Overall risk: LOW.** This cycle is almost entirely narrow, well-tested correctness
+fixes (each ships a regression test) rather than architectural change. Two items touch
+paths we actually exercise; both are accounted for.
+
+| # | Change | Touches our path? | Risk | Notes |
+|---|--------|-------------------|------|-------|
+| #408 | Honor safetensors index (Load.swift) | **Yes** — every model load | **Medium** | Our fork's nil-guard preserved through the merge. New behavior only differs when a valid `model.safetensors.index.json` is present (loads referenced shards); otherwise identical enumeration. |
+| #346 | Gemma 3 chunked prefill / `prefillStepSize: Int?` | **Yes** — `AIChatModelMLX.swift:1077` | **Low** | Signature changed `Int` → `Int?`; our assignment `params.prefillStepSize = chatConfig.n_batch` (only when `> 0`) still compiles and works. We override Gemma 3's tuned default of 128 with `n_batch` (512), but the `lm_head`-skip speedup applies regardless of chunk size. |
+| #388 | Gemma tool-arg type coercion | Indirect (internal parser) | **Low** | Pure improvement; only affects Gemma tool calls, which previously passed string args. |
+| #411, #403, #419, #390 | Qwen3-VL / Qwen3.5-VL / Qwen2.5-VL / Gemma 4 VLM fixes | Yes if those models are run | **Low** | Each is a targeted fix with a regression test; strictly improves correctness for the affected model. |
+| #413, #418, #386, #416, #404 | ChatSession / MLXEmbedders / CI | **No** | **None** | Unused code paths or dev tooling. |
+
+**Watch-items after upgrade:**
+1. Smoke-test one **Gemma 3** text model (prefill speedup path) and confirm output is unchanged.
+2. Smoke-test one **VLM** model with an image (Qwen3-VL / Gemma 4) to confirm the load and image-preprocess fixes behave.
+3. Confirm MLX model loading still succeeds for a model **with** and **without** a `model.safetensors.index.json` (the #408 branch).
+
+**Not addressed by this task (tracked separately in the upgrade skill):** mlx-swift /
+mlx-core version-pin reconciliation and re-application of the PrismML 1-bit/2-bit
+quantization patch. Note #404 references upstream requiring **mlx-swift ≥ 0.31.5**
+(CudaBuild plugin) for its CI — verify our pin during the pin-reconciliation step.

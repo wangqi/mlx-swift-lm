@@ -3,7 +3,7 @@
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
 starting from. Update this file on every upgrade (it is part of the `mlx-swift-lm-upgrade` skill's deliverables).
 
-**Last updated:** 2026-07-03
+**Last updated:** 2026-07-14
 
 > These three are **independent local git repos** under `thirdparty/` (not app submodules). The app
 > (`AIAssistant.xcodeproj`) wires them as local SwiftPM packages; a root-level `XCLocalSwiftPackageReference` for
@@ -16,12 +16,12 @@ starting from. Update this file on every upgrade (it is part of the `mlx-swift-l
 
 | Repo | Remote (origin) | Branch | HEAD | Role |
 |------|-----------------|--------|------|------|
-| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20260703` | `b3c92bf` | LLM/VLM layer (the package upgraded every 7-10 days) |
+| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20260714` | `299447e` | LLM/VLM layer (the package upgraded every 7-10 days) |
 | `thirdparty/mlx-swift`    | `wangqi/mlx-swift`    | `prism-1bit-0.31.4` | `5e97310` | Swift API + vendored mlx-core; carries the PrismML patch |
 | `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`) | `prism-1bit-0.31.1` | `48db7fe5` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
 
 ### Engine version surfaced in the app
-- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20260703"` (`views/settings/models/LocalModelAboutView.swift`).
+- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20260714"` (`views/settings/models/LocalModelAboutView.swift`).
 
 ---
 
