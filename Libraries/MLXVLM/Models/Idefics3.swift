@@ -730,7 +730,7 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -740,21 +740,22 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: inputIds,
             pixelValues: pixelValues
         )
-        // Chunked prefill on every platform (upstream PR #297 enabled chunking on
-        // macOS too). Use the shared chunkedVLMPrefill helper so iOS / Catalyst
-        // still avoid the [1, h, N, N] Metal attention abort, and macOS honors
-        // windowSize. Closure returns LMOutput; helper's final residue pass yields
-        // logits with vision embeddings included — wangqi modified 2026-05-16
-        return chunkedVLMPrefill(
-            inputIds: inputIds,
-            inputEmbeddings: embeddings,
-            visualMask: nil,
-            deepstackEmbeds: nil,
-            cache: cache,
-            windowSize: windowSize
-        ) { _, embChunk, _, _ in
-            return self.languageModel(nil, cache: cache, inputs_embeds: embChunk)
+
+        // Prefill the merged image+text embeddings in chunks, matching mlx-vlm
+        // (and `LLMModel.prepare`'s token chunking): evaluate the KV cache
+        // between chunks, leaving the last embedding for the logits.
+        let totalTokens = embeddings.dim(1)
+        let processed = try prefill.forEachChunk(total: totalTokens) { range in
+            _ = languageModel(nil, cache: cache, inputs_embeds: embeddings[0..., range])
+            eval(cache)
         }
+
+        // The prefix is now in the KV cache; the final embedding(s) yield the
+        // first-token logits.
+        let result = languageModel(
+            nil, cache: cache, inputs_embeds: embeddings[0..., processed...])
+        prefill.progress?(totalTokens, totalTokens)
+        return .logits(result)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

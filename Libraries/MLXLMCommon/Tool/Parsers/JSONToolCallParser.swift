@@ -7,6 +7,7 @@ import Foundation
 public struct JSONToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
 
     public init(startTag: String, endTag: String) {
         self.startTag = startTag
@@ -29,14 +30,15 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // wangqi modified 2026-03-10 (merged 2026-07-03, re-merged 2026-08-10): after upstream's
+        // own JSON recovery, fall back to the XMLFunction format for models (e.g. Qwen3.5-2B) that
+        // emit <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
+        // The two recoveries are disjoint: upstream's handles malformed JSON, the fork's handles a
+        // wholly different syntax nested in JSON tags.
         guard
-            let data = jsonStr.data(using: .utf8),
-            let toolCall = parseToolCall(from: data)
+            let toolCall = parseToolCall(from: jsonStr)
+                ?? parseRedundantOuterBraces(from: jsonStr)
         else {
-            // wangqi modified 2026-03-10 (merged 2026-07-03): Fall back to XMLFunction format for models
-            // (e.g. Qwen3.5-2B) that generate <function=name><parameter=key>value</parameter></function>
-            // inside <tool_call> tags. Upstream's parseToolCall(from:) supersedes the fork's old
-            // normalizedToolCallData helper (it also handles id + nested function + stringified args).
             return XMLFunctionParser().parse(content: content, tools: tools)
         }
 
@@ -57,6 +59,28 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         }
 
         return toolCall
+    }
+
+    /// Some Qwen chat templates emit an EOS-delimited JSON call with a
+    /// redundant leading brace and two redundant closing braces.
+    /// Recover only that exact shape and only when the enclosed prefix is one
+    /// complete, valid tool-call object followed solely by those braces.
+    private func parseRedundantOuterBraces(from text: String) -> ToolCall? {
+        guard text.hasPrefix("{{") else { return nil }
+        let withoutLeadingBrace = String(text.dropFirst())
+        guard let split = jsonObjectScanner.splitLeadingObject(from: withoutLeadingBrace) else {
+            return nil
+        }
+        let trailing = split.trailing.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trailing == "}}" else {
+            return nil
+        }
+        return parseToolCall(from: split.object)
+    }
+
+    private func parseToolCall(from text: String) -> ToolCall? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return parseToolCall(from: data)
     }
 
     private func parseToolCall(from data: Data) -> ToolCall? {

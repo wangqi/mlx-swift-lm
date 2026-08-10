@@ -714,8 +714,8 @@ private enum PixtralLanguage {
 
         func newCache(parameters: GenerateParameters?) -> [KVCache] {
             (0 ..< config.numHiddenLayers).map { _ in
-                if let maxKVSize = parameters?.maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                if let capacity = parameters?.effectiveKVCacheCapacity {
+                    return capacity.makeRotatingCache()
                 } else {
                     return KVCacheSimple()
                 }
@@ -870,7 +870,7 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -883,41 +883,19 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues
         )
 
-#if os(iOS) || targetEnvironment(macCatalyst)
-        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // Closure returns LMOutput (wrapping languageModel's raw logits) so the
-        // helper's final residue pass yields sampler-ready logits with vision
-        // embeddings included — wangqi modified 2026-05-16
-        return chunkedVLMPrefill(
-            inputIds: inputIds,
-            inputEmbeddings: embeddings,
-            visualMask: nil,
-            deepstackEmbeds: nil,
-            cache: cache,
-            windowSize: windowSize
-        ) { idsChunk, embChunk, _, _ in
-            let logits = self.languageModel(idsChunk ?? inputIds, cache: cache, inputsEmbeds: embChunk)
-            return LMOutput(logits: logits)
-        }
-#else
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = embeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(
                 inputIds[0..., range], cache: cache,
                 inputsEmbeds: embeddings[0..., range, 0...])
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let logits = languageModel(
             inputIds[0..., processed...], cache: cache,
             inputsEmbeds: embeddings[0..., processed..., 0...])
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(.init(logits: logits))
-#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

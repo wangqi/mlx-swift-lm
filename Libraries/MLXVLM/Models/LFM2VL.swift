@@ -1087,7 +1087,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1143,42 +1143,26 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask: pixelAttentionMask
         )
 
-#if os(iOS) || targetEnvironment(macCatalyst)
-        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // Closure returns LMOutput; helper's final residue pass yields logits with
-        // vision embeddings included — wangqi modified 2026-05-16
-        return chunkedVLMPrefill(
-            inputIds: input.text.tokens,
-            inputEmbeddings: inputEmbeddings,
-            visualMask: nil,
-            deepstackEmbeds: nil,
-            cache: cache,
-            windowSize: windowSize
-        ) { _, embChunk, _, _ in
-            return self.languageModel(nil, cache: cache, inputsEmbeds: embChunk)
-        }
-#else
-        let result = withPreparedCache(cache, lengths: input.text.sequenceLengths) {
-            let prefillStepSize = windowSize ?? 512
+        // Merge note 2026-08-10: the fork's iOS-only chunkedVLMPrefill branch is retired here.
+        // Upstream now chunks this prefill on every platform via prefill.forEachChunk, which
+        // bounds the attention activation the same way the fork's helper did, and additionally
+        // gives cooperative cancellation and a per-chunk autorelease pool.
+        let result = try withPreparedCache(cache, lengths: input.text.sequenceLengths) {
             let totalPositions = inputEmbeddings.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                let range = processed ..< (processed + chunkLength)
+            let processed = try prefill.forEachChunk(total: totalPositions) { range in
                 _ = languageModel(
                     nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., range, 0...])
                 asyncEval(cache)
-                processed += chunkLength
             }
-            eval(cache)
+            if processed > 0 { eval(cache) }
 
             let result = languageModel(
                 nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., processed..., 0...])
+            prefill.progress?(totalPositions, totalPositions)
             return result
         }
 
         return .logits(result)
-#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
@@ -1424,4 +1408,10 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
         case _maxTiles = "max_tiles"
         case _downsampleFactor = "downsample_factor"
     }
+}
+
+// MARK: - Chat conventions
+
+extension LFM2VL {
+    public var toolCallFormat: ToolCallFormat? { .lfm2 }
 }

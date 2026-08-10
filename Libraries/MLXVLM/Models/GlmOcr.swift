@@ -1017,7 +1017,8 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?,
+        prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1047,15 +1048,17 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
 
 #if os(iOS) || targetEnvironment(macCatalyst)
         // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // Closure returns LMOutput; helper's final residue pass yields logits with
-        // vision embeddings included — wangqi modified 2026-05-16
-        return chunkedVLMPrefill(
+        // Upstream's prepare is still single-shot here (it only reports terminal
+        // progress), so the fork patch stays. Closure returns LMOutput; the helper's
+        // final residue pass yields logits with vision embeddings included.
+        // wangqi modified 2026-05-16 / ported to prefill: 2026-08-10
+        return try chunkedVLMPrefill(
             inputIds: input.text.tokens,
             inputEmbeddings: inputEmbeddings,
             visualMask: nil,
             deepstackEmbeds: nil,
             cache: cache,
-            windowSize: windowSize
+            prefill: prefill
         ) { _, embChunk, _, _ in
             return self.languageModel(
                 nil, cache: cache, state: state, inputEmbedding: embChunk)
@@ -1063,6 +1066,9 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
 #else
         let result = languageModel(
             nil, cache: cache, state: state, inputEmbedding: inputEmbeddings)
+
+        let total = inputEmbeddings.dim(1)
+        prefill.progress?(total, total)
         return .logits(result)
 #endif
     }

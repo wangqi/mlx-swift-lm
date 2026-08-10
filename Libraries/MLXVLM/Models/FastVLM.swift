@@ -1128,7 +1128,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(
-        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, windowSize: Int?
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
         -> PrepareResult
     {
@@ -1137,36 +1137,16 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: input.image?.pixels,
             mask: input.text.mask
         )
-#if os(iOS) || targetEnvironment(macCatalyst)
-        // Chunked prefill on iOS / Catalyst to avoid [1, h, N, N] attention abort.
-        // Closure returns LMOutput; helper's final residue pass yields logits with
-        // vision embeddings included — wangqi modified 2026-05-16
-        return chunkedVLMPrefill(
-            inputIds: input.text.tokens,
-            inputEmbeddings: embeddings,
-            visualMask: nil,
-            deepstackEmbeds: nil,
-            cache: cache,
-            windowSize: windowSize
-        ) { _, embChunk, _, _ in
-            return self.languageModel(nil, cache: cache, inputEmbedding: embChunk)
-        }
-#else
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = embeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(nil, cache: cache, inputEmbedding: embeddings[0..., range, 0...])
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let result = languageModel(
             nil, cache: cache, inputEmbedding: embeddings[0..., processed..., 0...])
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
-#endif
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {

@@ -352,7 +352,7 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         private let _inChannels: Int?
         public var inChannels: Int { _inChannels ?? 3 }
         private let _hiddenAct: String?
-        public var hiddenAct: String { _hiddenAct ?? "gelu" }
+        public var hiddenAct: String { _hiddenAct ?? "gelu_pytorch_tanh" }
         private let _deepstackVisualIndexes: [Int]?
         public var deepstackVisualIndexes: [Int] { _deepstackVisualIndexes ?? [] }
 
@@ -458,6 +458,17 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
 // MARK: - Vision
 
 enum Qwen3VLVision {
+
+    private static func geluApproximation(for hiddenAct: String) -> GELU.Approximation {
+        switch hiddenAct {
+        case "gelu_pytorch_tanh", "gelu_new":
+            .tanh
+        case "gelu_fast":
+            .fast
+        default:
+            .none
+        }
+    }
 
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let half = x.dim(-1) / 2
@@ -680,10 +691,11 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "linear_fc2") var linear2: Linear
         @ModuleInfo(key: "act") var activation: GELU
 
-        init(dim: Int, hiddenDim: Int) {
+        init(dim: Int, hiddenDim: Int, hiddenAct: String) {
             _linear1.wrappedValue = Linear(dim, hiddenDim, bias: true)
             _linear2.wrappedValue = Linear(hiddenDim, dim, bias: true)
-            _activation.wrappedValue = GELU(approximation: .fast)
+            _activation.wrappedValue = GELU(
+                approximation: Qwen3VLVision.geluApproximation(for: hiddenAct))
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -701,7 +713,10 @@ enum Qwen3VLVision {
             _norm1.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _norm2.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _attention.wrappedValue = Attention(dim: config.hiddenSize, numHeads: config.numHeads)
-            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize)
+            _mlp.wrappedValue = MLP(
+                dim: config.hiddenSize,
+                hiddenDim: config.intermediateSize,
+                hiddenAct: config.hiddenAct)
         }
 
         func callAsFunction(
@@ -1730,13 +1745,15 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        // wangqi modified 2026-07-22: keep windowSize named (chunked prefill body below
-        // consumes it); take upstream's added state param, unused here (chunks pass state: nil).
-        state _: LMOutput.State?,
-        windowSize: Int?
+        // wangqi modified 2026-07-22 / 2026-08-10: keep prefill named (the chunked prefill
+        // body below consumes it). `state` must stay named too — the macOS single-shot
+        // branch forwards it; the iOS chunked branch ignores it and passes state: nil
+        // per chunk, relying on the ropeDeltas autoregressive path instead.
+        state: LMOutput.State?,
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
-        // Trace VLM prefill — Qwen3VL evaluates the entire prompt in a single forward pass
-        // (windowSize ignored). On long prompts (e.g. tools-expanded), the languageModel(...)
+        // Trace VLM prefill — upstream's Qwen3VL still evaluates the entire prompt in a
+        // single forward pass. On long prompts (e.g. tools-expanded), the languageModel(...)
         // call below can abort at Metal level — wangqi modified 2026-05-15
         MLXLogCollector.shared.log("[Qwen3VL.model.prepare] enter promptTokens=\(input.text.tokens.size) hasImage=\(input.image != nil) hasVideo=\(input.video != nil)")
         let inputIds = input.text.tokens
@@ -1808,13 +1825,13 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         // extra text-only callAsFunction hop on every prompt.
         // wangqi modified 2026-05-16
         MLXLogCollector.shared.log("[Qwen3VL.model.prepare] chunked prefill inputIds=\(inputIds.size) hasInputEmbeddings=\(inputEmbeddings != nil)")
-        let result = chunkedVLMPrefill(
+        let result = try chunkedVLMPrefill(
             inputIds: inputIds,
             inputEmbeddings: inputEmbeddings,
             visualMask: visualMask,
             deepstackEmbeds: deepstackEmbeds,
             cache: cache,
-            windowSize: windowSize
+            prefill: prefill
         ) { idsChunk, embChunk, maskChunk, deepstackChunk in
             // Pass state: nil so each chunk's callAsFunction lazily computes
             // (and caches into its own local state copy) the M-RoPE positions;
@@ -1843,7 +1860,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         let languageOutput = languageModel(
             inputIds,
             cache: typedCache,
-            state: nil,
+            state: state,
             inputEmbeddings: inputEmbeddings,
             mask: nil,
             positionIds: nil,
@@ -1854,6 +1871,8 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             videoGridTHW: videoFrames)
         MLXLogCollector.shared.log("[Qwen3VL.model.prepare] languageModel returned")
 
+        let total = inputIds.dim(-1)
+        prefill.progress?(total, total)
         return .logits(languageOutput)
 #endif
     }
@@ -1945,4 +1964,10 @@ public struct Qwen3VLMessageGenerator: MessageGenerator {
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
     }
+}
+
+// MARK: - Chat conventions
+
+extension Qwen3VL {
+    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
 }
