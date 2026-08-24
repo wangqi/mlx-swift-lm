@@ -1371,6 +1371,37 @@ enum Qwen3VLLanguage {
             if positionIds == nil && (mask == nil || mask?.ndim == 2) {
                 if (cache?.first?.offset ?? 0) == 0 || state[ropeDeltasKey] == nil || cache == nil {
                     if let inputIds {
+                        // Position this window at the absolute place the KV cache says it starts,
+                        // instead of always at zero.
+                        //
+                        // This branch is entered once per PREFILL WINDOW, and a window is very
+                        // often not the start of the sequence:
+                        //   - chunked prefill (`chunkedVLMPrefill`) feeds N slices and passes
+                        //     `state: nil` for each, so `state[ropeDeltasKey] == nil` short-circuits
+                        //     this condition to true on every chunk, not just the first;
+                        //   - a warm continuation that resumes a cached prefix feeds only the
+                        //     suffix.
+                        // In both cases `getRopeIndex` was called with the default
+                        // `positionOffset: 0`, so every window after the first was given M-RoPE
+                        // positions starting at absolute zero — chunk 2 of a 20K prompt was told it
+                        // sat at positions 0..509 rather than 510..1019. The attention layer already
+                        // derives correct offsets from `cache.offset` when `positionIds` is nil; it
+                        // is this computed value that overrides it.
+                        //
+                        // `cache.first.offset` is exactly the number of positions already
+                        // represented, which is the definition of `positionOffset` in the doc
+                        // comment on `getRopeIndex`. Zero for a cold first window, so the
+                        // single-window case is byte-identical to before.
+                        // Scoped to TEXT-ONLY windows. For a vision window the correct value is the
+                        // full "Position Anchor" the `getRopeIndex` doc describes — cache offset
+                        // PLUS the rope delta the cached images already accumulated — and the cache
+                        // offset alone is closer than zero but still not that. Vision windows are
+                        // therefore left exactly as they were rather than half-corrected here; the
+                        // agent and text-chat paths, which is what this fixes, never take that
+                        // branch.
+                        // wangqi modified 2026-08-23
+                        let isTextOnly = imageGridTHW == nil && videoGridTHW == nil
+                        let positionOffset = isTextOnly ? (cache?.first?.offset ?? 0) : 0
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputIds,
                             imageGridTHW: imageGridTHW,
@@ -1379,10 +1410,21 @@ enum Qwen3VLLanguage {
                             imageTokenId: config.imageTokenIndex,
                             videoTokenId: config.videoTokenIndex,
                             visionStartTokenId: config.visionStartTokenId,
-                            attentionMask: mask)
+                            attentionMask: mask,
+                            positionOffset: positionOffset)
 
                         positionIds = computed
-                        state[ropeDeltasKey] = deltas
+                        // The delta this state carries is consumed by the AUTOREGRESSIVE branch
+                        // below as `lastCacheOffset + delta`, where `lastCacheOffset` already counts
+                        // the whole prompt. For a text-only sequence `getRopeIndex` returns
+                        // `positionOffset` as its delta (positions are `arange + positionOffset`,
+                        // so `maxPos + 1 - tokenCount` collapses to the offset) — feeding that back
+                        // would add the offset a second time and put the first generated token at
+                        // `promptLength + positionOffset`. It must be zero: a text-only sequence's
+                        // next position IS the cache offset. Vision sequences keep the real delta,
+                        // which encodes how far images pushed positions past the token count.
+                        // wangqi modified 2026-08-23
+                        state[ropeDeltasKey] = isTextOnly ? zeros(like: deltas) : deltas
                     } else if let cache, state[ropeDeltasKey] == nil {
                         let batch = inputEmbeddings!.dim(0)
                         let seqLength = inputEmbeddings!.dim(1)
