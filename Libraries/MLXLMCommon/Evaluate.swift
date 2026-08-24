@@ -1706,6 +1706,54 @@ public func generate(
     return stream
 }
 
+/// Same as `generate(input:cache:parameters:context:components:wiredMemoryTicket:fallbackToolCallParser:)`
+/// above, but ALSO returns the token ids the model generated.
+///
+/// A caller that holds a `[KVCache]` across calls needs those ids. After generation the cache
+/// represents prompt + generation, so a ledger recording only the prompt has drifted, and on a
+/// hybrid topology (`MambaCache.isTrimmable == false`) the generation cannot be trimmed back off.
+/// The only strategy such a cache can execute is pure append, and appending requires knowing
+/// exactly what the cache already holds. This is precisely what `ChatSession` does for itself via
+/// the internal `generateTaskRecordingTokens` / `Conversation.record`; this overload makes the
+/// same thing reachable from outside the module.
+///
+/// Detokenize/retokenize is NOT an acceptable substitute: the round trip is not guaranteed to
+/// reproduce the ids the model emitted, and a wrong ledger is silent corruption rather than an
+/// error.
+///
+/// Await the returned task only after the stream has drained. Abandoning the stream leaves the
+/// iterator using the model, parameters and KV cache for a short while longer, and the task does
+/// not complete until it stops.
+// wangqi added 2026-08-24
+public func generateRecordingTokens(
+    input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    fallbackToolCallParser: (any ToolCallParser)? = nil
+) throws -> (AsyncStream<Generation>, Task<[Int], Never>) {
+    MLXLogCollector.shared.log(
+        "[Evaluate.generateRecordingTokens] enter promptTokens=\(input.text.tokens.size) hasCache=\(cache != nil)"
+    )
+    let iterator = try TokenIterator(
+        input: input, model: context.model, cache: cache, parameters: parameters,
+        components: components)
+    MLXLogCollector.shared.log("[Evaluate.generateRecordingTokens] tokenIterator built")
+    return generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        tokenCollector: RecordingGeneratedTokens(),
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
+            format: context.configuration.toolCallFormat ?? .json,
+            fallbackParser: fallbackToolCallParser
+        )
+    )
+}
+
 /// Generates text and tool calls asynchronously using speculative decoding with a draft model.
 ///
 /// This function uses a smaller draft model to propose tokens that are verified in batch

@@ -3,7 +3,7 @@
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
 starting from. Update this file on every upgrade (it is part of the `mlx-swift-lm-upgrade` skill's deliverables).
 
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-24
 
 > These three are **independent local git repos** under `thirdparty/` (not app submodules). The app
 > (`AIAssistant.xcodeproj`) wires them as local SwiftPM packages; a root-level `XCLocalSwiftPackageReference` for
@@ -41,6 +41,65 @@ on the 0.31.4 release** unless upstream forces a move.
 `mlx-swift` `main` HEAD (`e23ae6b`) is past 0.31.4 and ships a CUDA build-tool plugin `Source/Encuda` that uses
 `Foundation.Process` — `API_UNAVAILABLE` on iOS — which hard-fails the iOS build (`cannot find type 'Process'`).
 The tagged 0.31.4 release has no `Encuda` target, so it is the safe base.
+
+---
+
+## Fork-local patches in `mlx-swift-lm` (carry these across every upgrade)
+
+Separate from the PrismML patch below, which lives in `mlx` / `mlx-swift`. Each block is marked in
+place with `// wangqi modified YYYY-MM-DD`, so `git diff` against the upstream tag finds them.
+
+### `Libraries/MLXLMCommon/ChatSession.swift` (2026-08-24)
+
+Two changes that **must not be separated** — shipping the first without the second turns a silent
+slowdown into an uncatchable process abort.
+
+1. **The attention-mask veto accepts an all-ones mask.** `carriesAttentionMask` was
+   `input.text.mask != nil`, and `Qwen3VL` / `Qwen3.5-VL` attach an all-ones `int8` mask
+   unconditionally on their *text-only* branch (`Qwen3VL.swift:121-124`) — so prompt-cache reuse was
+   vetoed on every turn for the entire family. Measured at 28.7k tokens: turns 2 and 3 cost 20.1s /
+   22.0s against a forced full prefill of 20.3s. The mask is inert: those models pass `mask: nil` to
+   their own language model on every branch, and `LMInput.Text.sequenceLengths` returns
+   `tokens.dim(1)` for an all-ones mask, identical to the no-mask fallback. Only a **sparse** mask is
+   a real exclusion. Widened to `int32` before summing so an `int8` accumulator cannot overflow.
+
+2. **The reduced input preserves the rank `prepare` produced.** All three reuse branches built
+   `LMInput(tokens: MLXArray(Array(promptTokenIds[...])))`, which is always 1-D because the ids came
+   from `asArray(Int.self)`. Right for the text path; wrong for a VLM, whose `prepare` produces
+   `[1, N]` and whose `getRopeIndex` opens with `inputIds.dim(1)` — `Fatal error: SmallVector out of
+   range` (`mlx/c/array.cpp:335`), not a Swift error. The mask veto had been accidentally shielding
+   every VLM from this. `preparedRank` is read **before** the switch, because the local function is
+   assigned back into `input` and reading it inside would be a simultaneous access to the same `var`.
+
+   Verified together by `IntegrationTesting/IntegrationTestingTests/KVCacheReuseProbeTests.swift`
+   (`MLX_RUN_KVCACHE_PROBE=1`): `qwen3-vl-4b` goes from `rebuild` every turn to 0.361s / 0.263s
+   against a 129.1s warm control, answers correct, no abort.
+
+### `Libraries/MLXLMCommon/Evaluate.swift` (2026-08-24)
+
+**`generateRecordingTokens`** — a public overload of `generate(input:cache:parameters:context:…)`
+that also returns `Task<[Int], Never>` carrying the ids the model emitted. Purely additive: it is the
+existing call plus the `RecordingGeneratedTokens` collector that `generateTaskRecordingTokens` (module-
+internal, used by `ChatSession`) already used.
+
+The app needs it because it holds a `[KVCache]` across calls and cannot use `ChatSession`. After
+generation the cache represents prompt + generation, and on a hybrid topology
+(`MambaCache.isTrimmable == false`) the generation cannot be trimmed back off — pure append is the
+only strategy such a cache can execute, and appending requires knowing exactly what the cache holds.
+Re-tokenizing the model's own text is not a substitute: it is not guaranteed to reproduce the ids it
+emitted, and a wrong ledger is silent corruption. See `helper/docs/mlx-swift.md` § 3a.
+
+### `IntegrationTesting/IntegrationTestingTests/KVCacheReuseProbeTests.swift` (new, 2026-08-24)
+
+Opt-in (`MLX_RUN_KVCACHE_PROBE=1`), loads GBs of weights, never runs by accident. Four cases pinning
+that **shape, not topology, decides whether a hybrid can reuse**: gemma-4 (dense) and Qwen3-VL
+(dense + all-ones mask) reuse; Qwen3.5-2B reuses in the **agent** shape and does not in a plain chat.
+`qwen3-vl-4b` loads from `MLX_QWEN3VL_DIR`, not a Hub id — `mlx-community/Qwen3-VL-4B-Instruct-4bit`
+ships one `model.safetensors` alongside a stale index naming two shards.
+
+> Running it: `-only-testing` needs the trailing `()` on a swift-testing id, or it matches nothing and
+> **exits zero having run no tests**. The env var must reach the test runner, so use
+> `TEST_RUNNER_MLX_RUN_KVCACHE_PROBE=1`, not a bare `MLX_RUN_KVCACHE_PROBE=1`.
 
 ---
 

@@ -923,12 +923,41 @@ public final class ChatSession {
                                 draftCacheIsAligned = true
                             }
 
+                            // Only a SPARSE attention mask anchors an input to a full prefill;
+                            // an all-ones mask does not. Qwen3-VL / Qwen3.5-VL attach an all-ones
+                            // int8 mask unconditionally on their TEXT-ONLY branch
+                            // (Qwen3VL.swift:121-124), so `mask != nil` vetoed reuse on every turn
+                            // for the entire family. Measured at 28.7k tokens: turns 2 and 3 cost
+                            // 20.1s / 22.0s against a forced full prefill of 20.3s -- i.e. the
+                            // whole prompt was re-prefilled every turn.
+                            //
+                            // The mask is inert: those models pass `mask: nil` to their own
+                            // language model on every branch, and `LMInput.Text.sequenceLengths`
+                            // returns `tokens.dim(1)` for an all-ones mask, identical to the
+                            // no-mask fallback. A sparse mask is different in kind -- it marks some
+                            // positions as padding, and a suffix prefill would apply it against the
+                            // wrong ones -- so that case still vetoes.
+                            //
+                            // Widened to int32 before summing so an int8 accumulator cannot
+                            // overflow on a long prompt.
+                            //
+                            // This change MUST ship together with the rank-preserving reduced input
+                            // below: the veto was accidentally shielding every VLM from a latent
+                            // rank bug, and relaxing it alone turns a silent slowdown into an
+                            // uncatchable `SmallVector out of range` abort.
+                            // wangqi modified 2026-08-24
+                            let carriesSparseAttentionMask: Bool = {
+                                guard let mask = input.text.mask else { return false }
+                                let setCount = mask.asType(.int32).sum().item(Int.self)
+                                return setCount != mask.size
+                            }()
+
                             let turn = PromptCacheTurn(
                                 promptTokens: promptTokenIds,
                                 carriesNewMedia: containsNewMedia,
                                 carriesPreparedMedia: input.image != nil || input.video != nil
                                     || input.audio != nil,
-                                carriesAttentionMask: input.text.mask != nil,
+                                carriesAttentionMask: carriesSparseAttentionMask,
                                 carriesModelState: lmState != nil,
                                 isToolResultContinuation: isToolResultContinuation,
                                 previousGenerationUncommittedTokens:
@@ -945,6 +974,7 @@ public final class ChatSession {
                                     && (draftKVCache.map { canTrimPromptCache($0.cache) } ?? true))
 
                             var decision = promptCachePolicy.decide(turn: turn, cache: cacheState)
+
 
                             // Rewinding is the one decision that can fail while being
                             // applied: a cache may trim fewer tokens than requested.
@@ -968,17 +998,48 @@ public final class ChatSession {
                                 }
                             }
 
+                            // Builds the reduced input for a partial prefill, PRESERVING the
+                            // rank `prepare` produced.
+                            //
+                            // These three cases used to be written inline as
+                            // `LMInput(tokens: MLXArray(Array(...)))`, which is always 1-D because
+                            // `promptTokenIds` came from `asArray(Int.self)`. That is right for the
+                            // text path -- `LLMModelFactory` builds 1-D inputs by construction --
+                            // and wrong for a VLM, whose `prepare` produces `[1, N]`. Nothing
+                            // caught it because the VLM path never reached here: the attention-mask
+                            // veto above rebuilt every time. With that veto relaxed, a 1-D input
+                            // reaches `Qwen3VL.getRopeIndex`, whose first line is
+                            // `(inputIds.dim(0), inputIds.dim(1))` -- `dim(1)` on a 1-D array is
+                            // `Fatal error: SmallVector out of range` (mlx/c/array.cpp:335), an
+                            // uncatchable abort rather than a Swift error.
+                            //
+                            // The mask is deliberately NOT carried over. It is inert (see the
+                            // derivation above), and slicing it to match would add a second thing
+                            // that has to stay in step with the token range for no behavioural
+                            // gain.
+                            // wangqi modified 2026-08-24
+                            //
+                            // `preparedRank` is read BEFORE the switch: the local function is
+                            // assigned back into `input`, and reading `input` inside it while the
+                            // assignment is in flight is a simultaneous access to the same `var`.
+                            let preparedRank = input.text.tokens.ndim
+                            func reducedInput(from index: Int) -> LMInput {
+                                var tokens = MLXArray(Array(promptTokenIds[index...]))
+                                if preparedRank == 2 {
+                                    tokens = tokens.expandedDimensions(axis: 0)
+                                }
+                                return LMInput(tokens: tokens)
+                            }
+
                             switch decision {
                             case .prefillAll:
                                 break
 
                             case .appendSuffix(let suffixStart, _):
-                                input = LMInput(
-                                    tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                input = reducedInput(from: suffixStart)
 
                             case .appendSuffixToMain(let suffixStart, _):
-                                input = LMInput(
-                                    tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
+                                input = reducedInput(from: suffixStart)
                                 // The draft does not represent the same private
                                 // Harmony path. Preserve the authoritative main
                                 // cache and use it alone for this continuation.
@@ -986,9 +1047,7 @@ public final class ChatSession {
                                 requiresMainOnlyContinuation = true
 
                             case .trimToCommonPrefix(let commonPrefixLength, _):
-                                input = LMInput(
-                                    tokens: MLXArray(
-                                        Array(promptTokenIds.dropFirst(commonPrefixLength))))
+                                input = reducedInput(from: commonPrefixLength)
 
                             case .rebuild:
                                 kvCache = KVCacheStorage(
