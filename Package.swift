@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import CompilerPluginSupport
@@ -25,6 +25,9 @@ let package = Package(
         .library(
             name: "MLXEmbedders",
             targets: ["MLXEmbedders"]),
+        .library(
+            name: "MLXRerankers",
+            targets: ["MLXRerankers"]),
         .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
@@ -62,7 +65,10 @@ let package = Package(
         // patch (thirdparty/mlx-swift -> wangqi/mlx-swift); taken out of SwiftPM GitHub
         // resolution. The app's root-level XCLocalSwiftPackageReference override pins the
         // same path for mlx-audio-swift too. See helper/docs/mlx-swift.md.
-        // wangqi modified 2026-06-22
+        // Upstream requires mlx-swift .upToNextMinor(from: "0.31.6") as of this merge
+        // (was 0.31.4) — the fork must be rebased onto that base and the PrismML delta
+        // re-applied before this pin is considered satisfied.
+        // wangqi modified 2026-06-22 / 2026-08-31
         .package(path: "../mlx-swift"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
@@ -125,6 +131,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXRerankers",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXEmbedders",
+            ],
+            path: "Libraries/MLXRerankers"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -142,6 +157,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/IntegrationTestHelpers",
@@ -157,6 +173,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
             ],
             path: "Tests/MLXLMTests",
             exclude: [

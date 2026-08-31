@@ -23,6 +23,7 @@ struct KVCacheConfigurationTests {
         #expect(TurboQuantKVCacheConfiguration.qualityFirst.valuePrecision == .fourBit)
         #expect(TurboQuantKVCacheConfiguration.balanced.keyPrecision == .affineEightBit)
         #expect(TurboQuantKVCacheConfiguration.balanced.valuePrecision == .threeBit)
+        #expect(VarianceNormalizedKVCacheConfiguration.memoryFirst.sinkhornIterations == 8)
     }
 
     @Test func invalidTypedValuesAreRejectedAtConstruction() {
@@ -85,8 +86,23 @@ struct KVCacheConfigurationTests {
         let parameters = GenerateParameters(kvCache: .init(capacity: capacity))
         let resolved = try parameters.resolvedKVCacheConfiguration()
 
-        #expect(parameters.effectiveKVCacheCapacity == capacity)
+        #expect(try parameters.effectiveKVCacheCapacity() == capacity)
         #expect(resolved?.capacity == capacity)
+    }
+
+    @Test func cachePlanPreservesRequestSourceWhenConfigurationsMatch() throws {
+        let legacy = try GenerateParameters(maxKVSize: 64).kvCachePlan()
+        let capacity = try KVCacheConfiguration.Capacity(maxTokens: 64)
+        let typed = try GenerateParameters(
+            kvCache: KVCacheConfiguration(
+                capacity: capacity,
+                compatibility: .allowPartial)
+        ).kvCachePlan()
+
+        #expect(legacy.configuration == typed.configuration)
+        #expect(legacy.requestSource == .legacy)
+        #expect(typed.requestSource == .typed)
+        #expect(legacy != typed)
     }
 
     @Test func typedConfigurationRejectsAllRotatingCacheByDefault() {
@@ -138,10 +154,33 @@ struct KVCacheConfigurationTests {
         #expect(report.processedTokenCount == nil)
         #expect(report.layers.count == 3)
         #expect(report.layers[0].path == [0, 0])
+        #expect(report.layers[0].kind == .stateSpace)
+        #expect(report.layers[0].capacitySource == nil)
         #expect(report.layers[0].state == .notApplicable)
         #expect(report.layers[1].path == [0, 1])
+        #expect(report.layers[1].kind == .attention(maxSize: nil))
+        #expect(report.layers[1].capacitySource == .unbounded)
         #expect(report.layers[1].resolvedStrategy == .affine)
+        #expect(report.layers[2].kind == .rotatingAttention(maxSize: 128, keep: 0))
+        #expect(report.layers[2].capacitySource == .modelDefined)
         #expect(report.layers[2].reason == .slidingWindow)
+    }
+
+    @Test func runtimeReportClassifiesVarianceNormalizedCache() throws {
+        let configuration = KVCacheConfiguration(
+            strategy: .varianceNormalized(
+                try .init(keyBits: 4, valueBits: 4, tileSize: 32, sinkhornIterations: 2)))
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+
+        let report = kvCacheRuntimeReport(cache: [cache], configuration: configuration)
+
+        #expect(report.layers.count == 1)
+        #expect(report.layers[0].kind == .attention(maxSize: nil))
+        #expect(report.layers[0].capacitySource == .unbounded)
+        #expect(report.layers[0].state == .active)
+        #expect(report.layers[0].resolvedStrategy == .varianceNormalized)
+        #expect(report.layers[0].reason == nil)
     }
 
     @Test func typedTurboQuantDispatchRewritesNestedAttentionCache() throws {

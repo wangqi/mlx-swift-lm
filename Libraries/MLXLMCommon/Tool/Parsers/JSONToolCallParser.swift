@@ -30,35 +30,17 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // wangqi modified 2026-03-10 (merged 2026-07-03, re-merged 2026-08-10): after upstream's
-        // own JSON recovery, fall back to the XMLFunction format for models (e.g. Qwen3.5-2B) that
-        // emit <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
-        // The two recoveries are disjoint: upstream's handles malformed JSON, the fork's handles a
-        // wholly different syntax nested in JSON tags.
-        guard
-            let toolCall = parseToolCall(from: jsonStr)
-                ?? parseRedundantOuterBraces(from: jsonStr)
-        else {
-            return XMLFunctionParser().parse(content: content, tools: tools)
-        }
-
-        // If tool schemas are provided, only accept calls to declared tools.
-        if let tools, !tools.isEmpty {
-            var isDeclaredTool = false
-            for tool in tools {
-                let functionSpec = tool["function"] as? [String: any Sendable]
-                if functionSpec?["name"] as? String == toolCall.function.name {
-                    isDeclaredTool = true
-                    break
-                }
-            }
-
-            guard isDeclaredTool else {
-                return nil
-            }
-        }
-
-        return toolCall
+        // wangqi modified 2026-03-10 (merged 2026-07-03, re-merged 2026-08-10 / 2026-08-31):
+        // after upstream's own JSON recovery, fall back to the XMLFunction format for models
+        // (e.g. Qwen3.5-2B) that emit <function=name><parameter=key>value</parameter></function>
+        // inside <tool_call> tags. The two recoveries are disjoint: upstream's handles malformed
+        // JSON, the fork's handles a wholly different syntax nested in JSON tags.
+        // The declared-tool authorization the fork used to repeat here is gone: upstream moved it
+        // into ToolCallProcessor.allowedToolNames, which rejects an undeclared name for every
+        // parser rather than only this one.
+        return parseToolCall(from: jsonStr)
+            ?? parseRedundantOuterBraces(from: jsonStr)
+            ?? XMLFunctionParser().parse(content: content, tools: tools)
     }
 
     /// Some Qwen chat templates emit an EOS-delimited JSON call with a

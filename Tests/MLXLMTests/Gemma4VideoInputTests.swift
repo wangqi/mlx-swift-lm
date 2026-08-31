@@ -54,7 +54,7 @@ struct Gemma4VideoInputTests {
                 ? LMInput(text: text, video: LMInput.ProcessedVideo(pixels: pixels))
                 : LMInput(text: text, image: LMInput.ProcessedImage(pixels: pixels))
             let result = try model.prepare(
-                input, cache: model.newCache(parameters: nil), state: nil,
+                input, cache: try model.newCache(parameters: nil), state: nil,
                 prefill: .init(stepSize: 1024))
             guard case .logits(let out) = result else {
                 Issue.record("Expected .logits from Gemma4.prepare (multimodal branch)")
@@ -94,7 +94,7 @@ struct Gemma4VideoInputTests {
         let input = LMInput(text: text, video: LMInput.ProcessedVideo(pixels: pixels))
 
         let result = try model.prepare(
-            input, cache: model.newCache(parameters: nil), state: nil,
+            input, cache: try model.newCache(parameters: nil), state: nil,
             prefill: .init(stepSize: 1024))
         guard case .logits(let out) = result else {
             Issue.record("Expected .logits from Gemma4.prepare")
@@ -115,8 +115,9 @@ struct Gemma4VideoInputTests {
         // Four synthetic 64x64 frames at 1s spacing.
         let frames = (0 ..< 4).map { i in
             UserInput.VideoFrame(
-                frame: CIImage(color: CIColor(red: 0.3, green: 0.5, blue: 0.7))
-                    .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64)),
+                image: .ciImage(
+                    CIImage(color: CIColor(red: 0.3, green: 0.5, blue: 0.7))
+                        .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))),
                 timeStamp: CMTime(value: Int64(i), timescale: 1))
         }
         let (pixels, frameCounts) = try await processor.processVideos(
