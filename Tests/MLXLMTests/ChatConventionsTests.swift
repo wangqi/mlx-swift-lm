@@ -84,13 +84,20 @@ final class ChatConventionsModelTests: XCTestCase {
         XCTAssertNil(model.toolCallFormat)
     }
 
-    /// Gemma 4 must resolve to `.gemma4`, and Gemma 1-3 to `.gemma`. Ported from the
-    /// fork's `ToolCallFormat.infer` tests when upstream deleted that table
-    /// (wangqi modified 2026-08-10). Worth keeping as an explicit assertion because
-    /// `.gemma4` is a fork-contributed format and the two families are one character
-    /// apart: the old table matched on `hasPrefix("gemma")` and needed gemma4 checked
-    /// first, a hazard that only disappears if each family keeps its own declaration.
-    func testGemma4DeclaresGemma4FormatAndGemmaDeclaresGemma() async throws {
+    /// Gemma 4 must resolve to `.gemma4`. Ported from the fork's `ToolCallFormat.infer`
+    /// tests when upstream deleted that table (wangqi modified 2026-08-10). Worth keeping
+    /// as an explicit assertion because `.gemma4` is a fork-contributed format and the two
+    /// families are one character apart: the old table matched on `hasPrefix("gemma")` and
+    /// needed gemma4 checked first, a hazard that only disappears if each family keeps its
+    /// own declaration.
+    ///
+    /// The Gemma 3 half asserted `.gemma` and was wrong from the day it was ported:
+    /// `Gemma3TextModel` has never declared a `toolCallFormat`, at the tag-20260810 merge
+    /// base or since, so it inherits the protocol default of `nil`. Pinning `nil` is the
+    /// more useful assertion anyway — it is exactly the silent degrade-to-`.json` that
+    /// `AIChatModelMLX` does with `toolCallFormat ?? .json`, and the thing to notice if
+    /// upstream ever gives Gemma 3 a declaration. wangqi modified 2026-08-31.
+    func testGemma4DeclaresGemma4FormatAndGemma3DeclaresNone() async throws {
         let gemma4 = try await LLMTypeRegistry.shared.createModel(
             configuration: Data(#"{"model_type": "gemma4_text"}"#.utf8),
             modelType: "gemma4_text")
@@ -99,7 +106,7 @@ final class ChatConventionsModelTests: XCTestCase {
         let gemma3 = try await LLMTypeRegistry.shared.createModel(
             configuration: Data(#"{"model_type": "gemma3_text"}"#.utf8),
             modelType: "gemma3_text")
-        XCTAssertEqual(gemma3.toolCallFormat, .gemma)
+        XCTAssertNil(gemma3.toolCallFormat)
     }
 
     func testQwen35DeclaresDualDialectToolFormat() throws {

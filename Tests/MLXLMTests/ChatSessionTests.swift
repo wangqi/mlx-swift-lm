@@ -670,7 +670,25 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
     }
 
-    func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
+    /// Fork divergence: an ALL-ONES mask does not veto reuse here, so this asserts reuse
+    /// where upstream asserts a rebuild.
+    ///
+    /// `ChatSession.carriesAttentionMask` is fork-local — `carriesSparseAttentionMask`
+    /// rather than upstream's `input.text.mask != nil`. An all-ones mask is inert: the
+    /// models that attach one pass `mask: nil` to their own language model on every branch,
+    /// and `LMInput.Text.sequenceLengths` returns `tokens.dim(1)` with or without it. This
+    /// test's own `MaskTolerantLanguageModel` says the same thing in its doc comment. Only a
+    /// SPARSE mask marks positions as padding a suffix prefill would misapply, and that case
+    /// still vetoes.
+    ///
+    /// Measured cost of upstream's rule on a real run (`agent_1787511070735498d`, Qwen3-VL):
+    /// `decision=rebuild reason=attentionMask` on all 13 rounds, 24.4 of 28.6 minutes of
+    /// generation spent re-prefilling an unchanged prefix. Upstream removed the mask from
+    /// Qwen3-VL itself in PR #549, but FastVLM, Pixtral, Idefics3, SmolVLM2, Mistral3,
+    /// MuseGlimmer, GlmOcr, Gemma4 and PaliGemma all still attach one, so the relaxation is
+    /// still load-bearing. See `helper/docs/mlx-swift.md` § 3a.
+    /// wangqi modified 2026-08-31.
+    func testExactPrefixReuseWithAnAllOnesMaskIsNotVetoed() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
         let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
@@ -686,7 +704,12 @@ public class ChatSessionTests: XCTestCase {
         let secondRenderedLengthValue = await lengthIterator.next()
         let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
 
-        XCTAssertEqual(second.info.promptTokenCount, secondRenderedLength)
+        // Upstream asserts equality here (a full rebuild). The fork reuses the prefix, so
+        // only the suffix is prefilled and the count is strictly smaller than the rendered
+        // prompt — while still being positive, which is what distinguishes reuse from a
+        // prompt that failed to render.
+        XCTAssertLessThan(second.info.promptTokenCount, secondRenderedLength)
+        XCTAssertGreaterThan(second.info.promptTokenCount, 0)
     }
 
     func testContinuationRebuildsCacheWhenTemplateRewritesPrefix() async throws {

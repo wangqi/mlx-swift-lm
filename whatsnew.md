@@ -1,58 +1,62 @@
-# mlx-swift-lm Upgrade — `tag-20260722` → `tag-20260810`
+# mlx-swift-lm Upgrade — `tag-20260810` → `tag-20260831`
 
-**Merged:** 2026-08-10
-**Upstream base:** `ml-explore/mlx-swift-lm` main (32 upstream commits; PRs #470, #453, #502, #482, #448, #467, #468, #469, #146, #506, #401, #465, #488, #479, #481, #472, #462, #483, #322, #391, #347, #379, #460, #456, #463, #485, #480, #477, #478, #464, #458, #513)
+**Merged:** 2026-08-31
+**Upstream base:** `ml-explore/mlx-swift-lm` main @ `ad00de5` (54 upstream commits; PRs #511, #592, #598, #587, #594, #572, #573, #568, #569, #585, #583, #582, #329, #575, #574, #576, #571, #567, #565, #564, #570, #544, #562, #375, #541, #557, #555, #507, #549, #559, #556, #531, #546, #509, #527, #538, #512, #534, #348, #532, #533, #530, #484, #529, #351, #521, #514, #523, #526, #516, #490, #519, #520, #475)
 **Local integration doc:** `helper/docs/mlx-swift.md`
 **Primary consumer:** `ai/AIChatModelMLX.swift`
 
-This upgrade brings 32 upstream commits. The single most important item for our iOS integration is **PR #470 (`PrefillParameters` + balanced chunking)**: upstream replaced the bare `windowSize: Int?` on `LanguageModel.prepare` with a `PrefillParameters` value carrying a step size, a chunking strategy, and a progress callback, and consolidated nine near-duplicate per-model chunk loops into one generic `PrefillParameters.forEachChunk` driver that runs **on every platform**. That driver now covers eight of the ten VLMs our fork was hand-patching for iOS, so those fork patches were deleted and the files are byte-identical to upstream again — only **Qwen3VL and GlmOcr** still carry the `#if os(iOS) … chunkedVLMPrefill … #else …` patch. Balanced chunking also cuts full prefill time ~9% at 32K with no accuracy change, and `chunkedVLMPrefill` itself now delegates to `forEachChunk`, inheriting cooperative cancellation, per-chunk autorelease pooling, and progress reporting for free.
+This upgrade brings 54 upstream commits. The single most important item for our integration is **PR #475 (prompt cache: persist model state, wire Qwen3-VL and GLM-OCR restoration, and fail closed)**. It gives Qwen3-VL, Qwen3.5-VL and GLM-OCR their own windowed `prepareContinuation` — vision tower, image→token merge, M-RoPE positions and per-layer deepstack tensors all sliced in lockstep, routed whenever `cacheOffset > 0 || tokens > window` on **every** platform. That retires the **last two** `chunkedVLMPrefill` fork patches (Qwen3VL, GlmOcr), so every `MLXVLM/Models/*.swift` file is now byte-identical to upstream for the first time since the fork began patching them.
+
+The same PR also **fails closed**: `QwenVL.continuationAnchor` throws `ContinuationStateError.missingState` when a warm cache arrives without the model's M-RoPE anchor in `LMOutput.State`. `ChatSession` threads that state across turns; our path drives `generate` directly and holds only `[KVCache]` — so this needed an app-side fix, without which **every warm-cache VLM turn would have failed**. See R1.
+
+The second theme is **throughput**: `up to ~1.8x faster model loads` (#575), fused Qwen GDN input projections (#572), direct MoE expert reduction (#573), shared fused router top-k across five more model families (#568/#567), compiled decode segments generalized to Qwen 3 Next (#569), and single-dispatch TurboFlash for short contexts (#520/#570). None of it needs a configuration change on our side.
 
 ---
 
 ## Highlights
 
-### On-device / iOS memory & stability
-- **Balanced prompt chunking, now the default (#470).** Prefill divides the prompt into the fewest near-equal chunks that respect the step-size ceiling, instead of a fixed stride plus a small remainder whose leftover forward costs ~3x per token at large KV length. Measured upstream on Qwen3.6-35B-A3B at 32K: 51.01s → 46.23s full prefill (~9%), decode unchanged, no accuracy regression. Our `n_batch` default is 512, the same ceiling the library uses, so the win applies without any configuration change.
-- **Chunked prefill is now generic and cross-platform (#470).** `PrefillParameters.forEachChunk` owns the loop, cancellation between chunks, an autorelease pool per chunk, and progress. Eight VLMs (FastVLM, Pixtral, LFM2VL, Gemma3, Mistral3, Idefics3, Qwen25VL, Qwen2VL) stopped being fork-patched because upstream chunks them itself; see R1.
-- **Qwen2.5-VL / Qwen2-VL windowed prefill + state-threaded warm continuation (#448).** `prepareContinuation` slices M-RoPE `positionIds` in lockstep with the embedding chunks and anchors rope deltas across turns, so the **image/video** path is chunked too — strictly better than the fork patch it replaced, which only chunked the text-only path.
-- **Typed KV cache configuration and runtime reporting (#453).** `GenerateParameters.kvCache: KVCacheConfiguration?` centralizes capacity / strategy / compatibility behind one resolved plan, threaded through the autoregressive, speculative, MTP, guided, and wired-memory paths. Legacy `maxKVSize` / `kvBits` / `kvScheme` still work and resolve to the same plan with `compatibility: .allowPartial`. `kvCacheRuntimeReport(cache:configuration:)` reports, per layer, whether the requested strategy is active / pending / skipped and why (`.slidingWindow`, `.unsupportedShape`, `.boundaryProtection`, …) — the first way to observe that our `kvBits = 4` is inert under a `RotatingKVCache`.
-- **MTP speculation stands down before the sliding cache wraps (#506).** A stream that crossed the sliding window kept drafting until the verify pass tripped a `slidingKvLen` precondition; the iterator now re-checks trim headroom each round. We do not use MTP, but the fix removes a hard-abort class from the shared iterator.
-- **Olmo3 sliding-window cache actually used (#462).** `newCache(parameters:)` had a non-optional parameter, so it was an unused overload and `sliding_attention` layers got an **unbounded** cache. Cached-forward smoke tests now cover every model with a bespoke `newCache` or hybrid layout.
+### Prompt cache & continuation (the area our fork invests in most)
+- **Windowed continuation for Qwen3-VL / Qwen3.5-VL / GLM-OCR, and it fails closed (#475).** `prepare` routes into `prepareContinuation` whenever the cache is warm or the prompt exceeds the window; the vision tower runs once over the remainder and the language model is driven in `prefill`-sized chunks, bounding attention scratch to `[heads, chunk, L]`. M-RoPE positions come from a position anchor (`QwenVL.continuationAnchor` = cache offset + the rope delta in `state`) rather than absolute zero. A warm cache with no anchor **throws** rather than silently repositioning the remainder.
+- **Cache reuse enabled for text-only inputs (#549).** Qwen3-VL's processor no longer attaches an all-ones `int8` mask to text-only prompts (`LMInput(tokens:)` instead of `LMInput(text: .init(tokens:mask:))`). This is upstream arriving at the same conclusion our 2026-08-23 fork patch did — from the other end, by removing the inert mask rather than relaxing the veto that tripped on it. **The fork patch is still load-bearing**: upstream fixed only Qwen3-VL, while FastVLM, Pixtral, Idefics3, SmolVLM2, Mistral3, MuseGlimmer, GlmOcr, Gemma4 and PaliGemma all still attach an all-ones mask on their text-only branch. Upstream's `testExactPrefixReuseRebuildsWhenPreparedInputHasMask` asserts the opposite of the fork and is adapted in the fork's copy — expect that collision on every future merge (recorded in `UPGRADING.md`).
+- **Reuse is reported, not discarded (#559).** `GenerateCompletionInfo` gains `cachedPromptTokenCount`, with derived `totalPromptTokenCount` and `cacheEfficiency`; `promptTokenCount` is documented as *prefilled* tokens only. **Attribution happens at the `ChatSession` boundary**, so on the `generate(input:cache:…)` path we drive it reports 0 — see R4.
+- **`maxKVSize` is honored across full, sliding-window and hybrid caches (#514).** `newCache` in ~20 model files (AfMoE, BaichuanM1, Exaone4, FalconH1, GPTOSS, Gemma3/3n/4/4Text, GraniteMoeHybrid, Jamba, LFM2, LFM2MoE, MiMoV2Flash, Mistral3Text, Nanbeige, NemotronH, Olmo3, Qwen35, Qwen3Next) moved onto `makeAttentionKVCache` / `makeSlidingWindowKVCache`. **This removes the reason our `resolveKVAndSampler` gives for never setting a capacity** — see R5.
+- **Variance-normalized KV cache (#329).** KVarN-inspired: Hadamard rotation, dual-axis log-domain variance normalization, asymmetric K/V quantization of completed tiles, exposed as `VarianceNormalizedKVCacheConfiguration` plus legacy `varn*` schemes. Explicitly *slower than the default cache on decode by design* — a memory-bound long-context trade, not a speed one.
+- **Speculation past the sliding window (#516).** `RotatingKVCache` gains staged transactional speculative rounds (`beginRound`/commit/`rewindLastRound`, `logicalView(tail:)`), so a rotating cache no longer needs post-hoc trimming that breaks once the ring has wrapped.
 
-### Performance (Qwen3.5 / 3.6, the family our on-device defaults use)
-- **Compiled decode traces (#467).** Decode runs through MLX compiled traces at three levels (per-MoE-block closure, per-layer trace, whole-step segment schedule). Token-identical over 108 A/B pairs. Decode throughput: MoE +7.5% short context / +3.7% at 8K; dense +1.7–3.5%.
-- **Fused router top-k Metal kernel for decode (#469).** Replaces the argPartition/takeAlong/normalise chain (three serial dispatches + hazard barriers per MoE layer per token) with one bit-identical kernel. Decode +1.91% at 128 context, +0.47% at 8K; dispatches per token 1914 → 1827. Decode-only — prefill keeps the block-sort path.
-- **GDN decode conv folded into the compiled step (#468).** At S == 1 the depthwise conv1d becomes elementwise multiply-adds that fold into the surrounding traced segment, removing a dispatch and a barrier per GDN layer per token. Bitwise identical (f32 accumulation, one rounding), CI-pinned.
-- **Gated delta recurrence precision (#488).** Kahan compensated summation for the recurrent k-state dot product so low-order terms do not drift at long context; Metal reassociation/contraction disabled only inside that reduction.
+### Performance
+- **Weight loading parallelized — up to ~1.8x (#575).** Each safetensors file's tensors are read from its own header, ordered by file offset, split into contiguous byte-balanced groups (~total / clamp(cores, 4…16), min 256 MiB), and evaluated from `concurrentPerform` work items, overlapping read/copy/allocation that a single `eval` serializes. The old `F_RDADVISE` prefetch measured <1% and often negative and was removed. Measured on an M4 Pro / NVMe ~6.1 GB/s: Muse-Glimmer-30B-4bit (18 GB, cold) 5.6–6.1s → 3.1s weight load; Qwen3.5-9B-8bit (9.7 GB, cold) 2.2–2.6s → 1.6–1.8s, ~2x warm. Checksum-verified bit-identical against the serial loader; a file whose header does not parse falls back to one whole-file work item.
+- **Fused Qwen GDN input projections (#572)**, and inference preparation moved onto the `LanguageModel` lifecycle (`prepare()`).
+- **Direct Qwen MoE expert reduction, on by default (#573).**
+- **Shared fused router top-k (#568, #567).** The Qwen3.5 decode-only Metal router kernel moved into `MLXLMCommon` and generalized for separate selection/score tensors while preserving winner order; now used by Qwen 3 MoE, OLMoE, Mixtral, Jamba and Granite MoE Hybrid. Prefill keeps the generic MLX path. Cross-dtype bitwise coverage plus per-model parity tests against each original router expression.
+- **Compiled decode segments generalized to Qwen 3 Next (#569).**
+- **Single-dispatch TurboFlash for short contexts (#520)**, with query grouping tuned for short decode (#570).
+- **Qwen3.5 MTP speculative decoding (#351).**
 
-### New models
-- **Qwen3-VL-MoE (#322)** — MoE variant of the Qwen3-VL vision family.
-- **DeepSeek-V2 / V2-Lite (#379)** — reuses the in-tree V3 MLA machinery; `q_lora_rank: null` (V2-Lite) now loads, and the double KV-cache update that corrupted attention past the first token is fixed.
-- **Hunyuan dense V1 (#347)** — `hunyuan_v1_dense`, the architecture behind the Hunyuan-MT-7B / Hy-MT2-7B translation models; per-head QK RMSNorm after RoPE, DynamicNTKAlphaRoPE.
-- **Nanbeige 4.2 (#460)** — a looped transformer: the decoder stack runs `effective_num_loops` times with shared weights, each pass owning its own slice of a `num_loops × num_hidden_layers` cache array.
-- **Gemma 4 video input (#391)** — end-to-end video on the base `gemma4` VLM; frames run through the same vision tower and scatter onto `<video>` soft-token positions, with ≤32-frame ~1 fps sampling in the processor.
+### Tool calling
+- **Parser hardening (#531).** Two real bugs. (a) `JSONValue.from` tested `as? Bool` before `as? Int`; `JSONSerialization` boxes scalars as `NSNumber`, and an `NSNumber` holding 0 or 1 bridges to `Bool` — so `{"limit": 1}` arrived as `{"limit": true}` in **every** parser that decodes a value as JSON (Gemma, Pythonic, XML function, GLM4, Kimi K2, MiniMax M2, Llama 3, Mistral, ATEM), breaking any integer-typed schema parameter. (b) Pythonic and Gemma argument splitting moved onto a shared `StructuredTextScanner`, so a value containing `)`, `]`, `,` or `:` survives intact — the lazy `\[(\w+)\((.*?)\)\]` regex used to lose everything from `)]` onward.
+- **Rejected tool calls are generation events (#512, #538).** `Generation.rejectedToolCall(RejectedToolCall)` and `ToolCallProcessor.Output.rejectedToolCall` carry tool-call-shaped output that parsing or authorization refused, with `rejectedToolCallCount` on the decoder. Declared-tool authorization moved into `ToolCallProcessor.allowedToolNames`, so it applies to **every** parser instead of only `JSONToolCallParser`.
+- **Gemma brace-form values (#557).** Gemma writes nested values as `{city: "Paris"}` — JSON except for unquoted keys, which `JSONSerialization` refuses, so an `object` parameter reached the tool as a string. Bare keys are now quoted and re-parsed; bare *values* deliberately are not (`{ok: yes}` has no JSON meaning).
+- **Qwen 3.5 JSON tool-call fallback (#529)**, a `.qwen35` format with its own parser.
+- **ATEM tool calling with Muse-Glimmer (#523)**, plus an Onyx stream adapter and tool-restart rule.
+- **Protocol-aware thinking budget enforcement (#521).**
 
-### New capabilities / API
-- **`PrefillParameters` (#470).** `GenerateParameters.prefill` carries `stepSize`, `chunking` (`.balanced` default / `.remainder` legacy / `.unchunked` escape hatch), and `progress: (processed, total) -> Void`. `prefillStepSize` is deprecated and forwards. **Consumer:** `AIChatModelMLX.buildGenerateParameters` already sets `prefill.stepSize` from `n_batch`; `progress` is newly adopted for `[MLX-PERF]` prefill instrumentation.
-- **`ChatConventionsProviding` everywhere; `ToolCallFormat.infer` / `ReasoningConfig.infer` deleted (#482, #502).** Every model declares its own tool-call format and reasoning config next to its definition; non-intrinsic conventions go through a new `ChatConventionsResolving` + `ChatConventionsRegistry` extension seam. Factory precedence: explicit `ModelConfiguration` value → registered resolver → the model's own declaration. **Consumer:** `AIChatModelMLX` reads `context.configuration.toolCallFormat`, which the factories now populate from the model — see R2.
-- **GPT-OSS Harmony tool-call parser (#146).** A `.gptOSS` `ToolCallFormat` plus a protocol-neutral `TokenStreamDecoder` seam that streaming tool-call decoding now routes through. Harmony deliberately bypasses the app's `fallbackToolCallParser` (its token-level framing has no ambiguous parse to recover from).
-- **Custom `LogitProcessor` injection (#401).** `GenerationComponents` threads a `@Sendable logitProcessorFactory` through `TokenIterator`, the speculative/MTP iterators, `ChatSession`, and the parameters-driven `generate` functions, chained after the built-in `PenaltyProcessor` (matching Python mlx-lm ordering). Additive; empty components reproduce prior behavior.
-- **Multi-round tool calling in MLXFoundationModels (#456).** Prior tool calls/results are replayed into the prompt and the tool path stays active each round.
+### New models & capabilities
+- **Muse-Glimmer (#523)** — 30B agentic multimodal, 52-layer dense text transformer + 50-layer native-resolution ViT.
+- **Helium / Kyutai (#555)**, **TranslateGemma (#348)** with its own chat template and a `ModelConfiguration.messageGenerator` override seam.
+- **Reranker API (#375)** — shared request/result types, encoder rerankers, Jina listwise reranker, BGE/Jina registry wiring.
+- **Video processing options (#534/#429)** — `UserInput.VideoProcessing` with `targetFrames` / `framesPerSecond`, threaded through `MediaProcessing.asProcessedSequence` and the VLM pipelines.
+- **LoRA dropout and training mode (#541)**; **opt-in q4_0 lattice calibration in conversion (#507)**.
 
-### Correctness fixes
-- **Streaming detokenizer dropped characters on non-append-only decodes (#465).** `NaiveStreamingDetokenizer.next()` diffed by character count, which assumes `decode()` is append-only — SentencePiece is not (Gemma rewrites whitespace at the append boundary), so a structural JSON comma was silently dropped. Now diffed by common prefix. Affects every Gemma/SentencePiece model's streamed text, not just guided generation.
-- **LFM2 tool-argument parsing (#481).** `PythonicToolCallParser` truncated object values at the first comma and never recovered the real args from a schema-style wrapper (`get_weather(properties={…})`). Argument splitting is now bracket/brace/quote-aware, object/array values parse as JSON, and a single recognized wrapper key is unwrapped. GLM-4-9B-0414's markerless `funcname\n{json}` shape is documented as unsupported and its end-to-end test disabled.
-- **Gemma 3n Boolean attention masks (#479).**
-- **Structured `ChatSession` continuations (#472)**, plus documented cache reuse across the chat APIs.
-- **Linux build breaks in MLXLMCommon / MLXGuidedGeneration (#483)** — an `autoreleasepool` shim, a per-module `Logger` shim with the full level set, and `-lc++` scoped to Apple platforms. Inert on our platforms; the `-lc++` scoping is the only line that touches our `Package.swift`.
+### Correctness fixes that matter to us
+- **Weight files a safetensors index leaves out (#562).** `BaseLanguageModel.additionalWeightFiles` lets a model name sidecars its index omits, and — the part that reaches our users — loading now **falls back to every safetensors file in the directory when the index names a file that is not there**. Several `mlx-community/Qwen3-VL-*` uploads kept the index of their unquantized source repo, so they named shards the repo does not ship and loading found no weights at all (#554).
+- **LFM2VL image token id read from the vocabulary instead of hardcoded 396 (#576).**
+- **Qwen2.5-VL vision cuSeqlens accumulated across temporal slices (#509).**
+- **Tied word-embedding (#532) and tied quantized Qwen3 MoE head (#490) sanitization.**
+- **`LogitProcessor` copy semantics enforced for speculative decoding (#533)** — draft and verify passes now run on copied processor state so unaccepted tokens cannot pollute canonical state.
 
 ### Build / toolchain
-- **No dependency move.** Upstream still pins `mlx-swift` `.upToNextMinor(from: "0.31.4")`; our fork keeps the local path dep. The only `Package.swift` change in this range is `.linkedLibrary("c++", .when(platforms: [.macOS, .iOS, .visionOS, .tvOS]))`. PrismML patch untouched.
-
-### Tests
-- New suites: `PrefillParametersTests`, `KVCacheConfigurationTests`, `KVCachePlanBenchmark`, `CachedForwardSmokeTests`, `ChatConventionsTests`, `Qwen25VLContinuationTests`, `Qwen35CompiledDecodeLifecycleTests`, `Qwen35GDNDecodeBitwiseTests`, `Qwen35RouterTopKBitwiseTests`, `Qwen3VLMoETests`, `HarmonyFrameParserTests` / `HarmonyOutputRouterTests` / `HarmonyToolRestartRuleTests` / `HarmonyChatSessionRoundTripTests`, `StreamingDetokenizerTests`, `DeepseekV2Tests`, `HunyuanTests`, `NanbeigeTests`, `GLM4MoERoutingTests`, `Gemma3nMaskTests`, `Gemma4VideoInputTests`, `PromptCacheReusePolicyTests`.
-- Gemma4 chunk-invariance oracles fixed for TF32/NAX flakiness (#485): synthetic models cast to f16, initializer weights pinned with `withRandomState`, max-abs-diff comparison. The chunking logic was correct; the oracle was not.
-- Integration-test CI scoped down and moved to a nightly cron with a tracking issue (#480, #477, #478, #464, #458, #513).
+- **`mlx-swift` requirement moved `0.31.4` → `0.31.6` (#484)** — "*.4 was missing new API that the current code calls*". That API is `MLXArray.maskFill(for:)` + the `DType.finfo` extensions from mlx-swift PR #429, used by `KVCache.swift` and `ThinkingBudget.swift`. **Our fork already carries it** as the additive #429 cherry-pick (`37b3ca1`) on top of the `0.31.4` base — see the dependency section below.
+- Compiler warnings cleared from the library and both test targets (#594); a `CLAUDE.md` / `AGENTS.md` and an AI usage policy added upstream (#585).
 
 ---
 
@@ -60,43 +64,48 @@ This upgrade brings 32 upstream commits. The single most important item for our 
 
 | Area | Effect on iOS |
 |------|---------------|
-| Prefill throughput | Balanced chunking is the default — ~9% faster full prefill at 32K, no accuracy change (#470) |
-| Fork patch surface | 8 of 10 VLM `chunkedVLMPrefill` patches deleted; only Qwen3VL + GlmOcr remain (#470, #448) |
-| Qwen2.5-VL / Qwen2-VL images | Image/video prefill is now chunked and rope-anchored across turns, not just the text-only path (#448) |
-| Qwen3.5 / 3.6 decode | +1.7–7.5% decode from compiled traces, plus ~+0.5–1.9% from the fused router kernel and the folded GDN conv (#467, #469, #468) |
-| Prefill observability | `prefill.progress` gives per-chunk `(processed, total)` — first direct measurement of where TTFT goes on a long prompt (#470) |
-| KV cache | Typed configuration + a per-layer runtime report that names why a strategy was skipped; legacy fields unchanged (#453) |
-| Streamed text | Gemma/SentencePiece models no longer silently drop characters at the append boundary (#465) |
-| Tool calling | Format resolution moved from `model_type` prefix matching to per-model declarations; unregistered types now resolve to `nil` (degrading to `.json`) instead of matching by prefix (#502) |
-| Dependency / PrismML | No `mlx-swift` / `mlx-core` version move — PrismML patch unaffected |
+| **VLM warm-cache turns** | **Would have failed outright** without the app-side fix in R1 — `prepare` now fails closed on a warm cache with no `LMOutput.State` |
+| Model load time | Concurrent byte-balanced weight loading, up to ~1.8x faster; no configuration change (#575) |
+| Fork patch surface | **Zero** VLM models fork-patched — Qwen3VL and GlmOcr, the last two, retired (#475) |
+| Qwen3-VL text turns | The inert all-ones mask is gone upstream, so the app's `sparseAttentionMask` veto can no longer be tripped by it (#549) |
+| Qwen3.5 / MoE decode | Fused GDN projections, direct expert reduction, shared fused router top-k, TurboFlash short-context path (#572, #573, #568, #520, #570) |
+| Tool calling | Integer arguments stop arriving as booleans; values containing `)]`,`:` stop being truncated; rejected calls are now an event we log (#531, #512) |
+| Model loading robustness | `mlx-community/Qwen3-VL-*` uploads with a stale index now load instead of finding no weights (#562) |
+| KV cache | A capacity is now honored on hybrid models instead of throwing — but we still do not set one, for a different reason (R5) (#514) |
+| Dependency / PrismML | No fork move needed: the required 0.31.6 API is the #429 cherry-pick the fork already carries. `QuantizationTests` 5/5 green |
 
 ---
 
-## Risk Assessment — **4 identified risks (2 medium, 2 low)**
+## Risk Assessment — **5 identified risks (1 high, 2 medium, 2 low)**
 
-### R1 — Eight VLM prefill paths changed owner in one merge (MEDIUM)
-The recurring chunked-prefill overlap, at its widest yet. Upstream replaced `prepare(_:cache:state:windowSize:)` with `prepare(_:cache:state:prefill:)`; where the new `forEachChunk` driver covers a model, the fork's iOS branch was deleted (FastVLM, Pixtral, LFM2VL, Gemma3, Mistral3, Idefics3, Qwen25VL, Qwen2VL). Two of those — Qwen25VL and Qwen2VL — also swapped a fork patch that chunked only the text path for upstream's `prepareContinuation` that chunks the image path too. Static analysis says this is strictly better; the runtime path on device is nonetheless new for eight models.
+### R1 — Warm-cache VLM continuation fails closed (HIGH — fixed in this cycle)
+PR #475 makes `QwenVL.continuationAnchor` throw `ContinuationStateError.missingState` when `cacheOffset > 0` and the model's M-RoPE anchor is absent from `LMOutput.State`. Three models call it: `MLXVLM/Models/Qwen3VL.swift`, `MLXVLM/Models/Qwen35.swift` (Qwen3.5-VL) and `MLXVLM/Models/GlmOcr.swift`. `ChatSession` threads that state turn to turn (`lmState = iterator.state`); **our path does not** — `predictVLM` calls `generateRecordingTokens(input:cache:…)` with no `state:`, and `MLXPromptCacheBox` holds only `[KVCache]` and the token ledger. Every turn after the first on those three models would therefore have thrown out of `TokenIterator.init` and surfaced to the user as a failed generation. Upstream pins the behavior in `Qwen3VLContinuationTests.testWarmContinuationWithoutStateThrows`.
 
-The sharp edge here is not the conflicts — it is the files that **did not** conflict. `Gemma3.swift` and `Mistral3.swift` auto-merged cleanly into non-compiling code (new `prefill:` signature, body still passing an undefined `windowSize`) with no marker to warn you. `swift build` targets macOS and never compiles the `#if os(iOS)` branch where the fork patch lives.
-*Verify:* build **both** schemes; grep every remaining `chunkedVLMPrefill` caller; run `testcases/MLXVLMLongPromptTests.swift` (updated for the `prefill:` signature in this cycle) on device against a real Qwen3VL checkpoint, plus a manual long-prompt and multi-turn-with-image smoke test on Qwen2.5-VL.
+*Fixed:* both `predictLLM` and `predictVLM` now catch `ContinuationStateError` specifically, invalidate the cache with reason `missingContinuationState`, and retry once at full prompt length. The anchor is the first thing `prepare` computes, so the failed attempt costs a template render rather than a prefill. Scoped to that typed error so a Metal OOM still fails the round instead of being retried at full length.
 
-### R2 — `ToolCallFormat.infer` deleted; formats now resolved per model (MEDIUM)
-`ToolCallFormat.infer(from:configData:)` and `ReasoningConfig.infer` no longer exist. Formats come from `ChatConventionsProviding` declarations resolved by the factories inside `_load` (both `loadContainer` overloads call it, so our local-directory loads do resolve). Upstream deliberately tightened behavior: prefix matching is gone, so **unregistered** model types (`lfm2_5`, `glm4_5`, `qwen3_next_moe`, `mistral3_text`) resolve to `nil`, and `nemotron_labs_diffusion` no longer reports `.xmlFunction`. In `AIChatModelMLX`, `modelConfiguration.toolCallFormat ?? .json` means a failed resolution degrades **silently** to JSON rather than erroring — a model that used to match by prefix will now quietly parse with the wrong format.
-*Verify:* the `[MLX-LLM] toolCallFormat=…` / `[MLX-VLM] toolCallFormat=…` log line already prints the resolved format on every generation. Check it for each shipped MLX model with tools enabled — especially any LFM2 / GLM / Mistral 3 variant — and register a `ChatConventionsResolving` resolver if one resolves to `nil(default:.json)` when it should not.
+*Residual:* VLM warm-turn reuse is **off** for those three models — back to where it was before the 2026-08-24 fork commit. Threading `LMOutput.State` through the box would restore it; see Follow-ups.
 
-### R3 — Streaming detokenizer diff changed for every model (LOW)
-`NaiveStreamingDetokenizer.next()` now diffs by common prefix instead of character count (#465). Identical output for append-only (byte-level BPE) tokenizers; for SentencePiece it stops dropping characters. Our streamed text goes straight into `process_predicted_str`, so the change is visible in chat output for Gemma-family models — as a fix, but it is a behavior change on a hot path.
-*Verify:* `StreamingDetokenizerTests` (model-free) plus one Gemma 3 / Gemma 4 chat with a multi-line, whitespace-heavy reply.
+### R2 — Concurrent weight loading raises peak memory during load (MEDIUM)
+`#575` opens up to `clamp(cores, 4...16)` byte-balanced groups (min 256 MiB each) and evaluates them concurrently. The measurements are M4 Pro / NVMe; an iPhone has fewer cores, far less headroom and a jetsam ceiling rather than swap. Our pre-load admission check (`SystemMemoryHelper`, `helper/docs/device_ram.md`) sizes a *serial* loader's peak.
+*Verify:* load the largest shipped MLX model on the smallest supported device with the memory HUD on, and compare peak against the pre-load estimate. If peak has moved, the estimate in `device_ram.md` needs a term for concurrent group residency.
 
-### R4 — New model families are untested on device (LOW)
-Qwen3-VL-MoE, DeepSeek-V2, Hunyuan dense V1, Nanbeige, and Gemma 4 video all ship with upstream unit tests but none is a default on-device model here. They only affect users who add such a checkpoint. Gemma 4 video is the one worth noting: our `predictVLM` deliberately feeds video as pre-sampled `.ciImage` frames rather than `UserInput.Video`, so the new `<video>` soft-token path does not engage — behavior for existing users is unchanged.
-*Verify:* nothing blocking; add the architectures to `mlxSwiftSupportedModels` (done) and revisit if a Gemma 4 video checkpoint is shipped.
+### R3 — Tool-call argument typing changed for every parser (MEDIUM)
+`#531` stops `NSNumber` 0/1 from bridging to `Bool`, so a schema-declared integer that previously arrived as `true`/`false` now arrives as `1`/`0`. This is a fix, but it changes the values our tools receive on a hot path, and any app-side code that came to depend on the buggy shape will change behavior. Combined with `#557` (Gemma brace-form objects now parse as objects rather than strings) and the structural scanner rewrite, three dialects changed their output types in one merge.
+*Verify:* `ToolCallParserChainTests` plus one real tool round-trip per shipped MLX model with an integer or object parameter — `run_shell`-style integer limits and any tool with a nested-object argument.
+
+### R4 — `cachedPromptTokenCount` reads 0 on our path (LOW)
+`#559` attributes cache reuse *at the `ChatSession` boundary*, because the generation loop receives an already narrowed prompt and has no notion of a prompt cache. We drive `generate`/`generateRecordingTokens` directly, so `GenerateCompletionInfo.cachedPromptTokenCount` is 0 and `cacheEfficiency` is 0 for us regardless of how much prefix we actually reused. Nothing breaks — `consumeMLXStream(fullPromptTokens:)` already overrides `promptTokenCount` with the whole rendered prompt for the token tracker — but the new field must not be mistaken for a usable signal.
+*Verify:* nothing blocking. Our `[MLX-KVREUSE] decision=…` line remains the authoritative reuse trace.
+
+### R5 — The stated reason for never setting a KV capacity is now obsolete (LOW)
+`resolveKVAndSampler` documented "any non-nil capacity makes ~12 models fail to generate" under the PR #453 contract. `#514` rewrote `newCache` in exactly those files onto `makeAttentionKVCache` / `makeSlidingWindowKVCache`, so a capacity is honored rather than rejected. The policy is unchanged — capacity stays nil — but for two different reasons that #514 does not address: `RotatingKVCache.isTrimmable` is `offset < maxCacheSize`, so every turn past the cap would fall to `notTrimmable -> rebuild` and re-prefill the whole prompt; and `keep: 4` rotates the system prompt and tool definitions out of anything longer than the cap.
+*Verify:* the rationale comment was rewritten this cycle. No behavior change.
 
 ---
 
 ## Follow-ups
-1. Build both schemes (`AIAssistant` iOS, `AIAssistantMac`) — the only way to compile the remaining `#if os(iOS)` fork branch.
-2. Run `testcases/MLXVLMLongPromptTests.swift` on device for R1 (Qwen3VL long prompt + Qwen2.5-VL multi-turn-with-image).
-3. Watch the `toolCallFormat=` log line on every shipped MLX model with tools enabled (R2); register a `ChatConventionsResolving` resolver for anything that degrades to `nil(default:.json)`.
-4. `helper/docs/mlx-swift.md` "Models currently patched" now reads **Qwen3VL and GlmOcr only** — keep it in sync on the next merge.
-5. **Not adopted, worth a plan:** upstream's prompt-cache reuse (`PromptCacheReusePolicy`, `PromptCacheTurn`) lives inside `ChatSession` and is `internal`, so it is unreachable from the `generate(input:parameters:context:)` path the app drives. Every turn of a chat therefore re-prefills the whole history. This is the largest remaining MLX latency win available to us and needs its own design pass (our `PromptAssembler`/CONTEXT.md pipeline owns prompt construction, so adopting `ChatSession` wholesale is not a drop-in).
+1. **Restore VLM prompt-cache reuse by threading `LMOutput.State` (R1).** `TokenIterator.state` is `public internal(set)` but `generate`/`generateRecordingTokens` consume the iterator into their `Task` and never hand it back, and `LMOutput.State` wraps `[String: Any]` and is not `Sendable`. Needs a fork-local seam surfacing the final state, plus a `state` slot on `MLXPromptCacheBox` invalidated in lockstep with the caches. Worth a design pass, not a drive-by.
+2. **Re-measure the pre-load memory admission check against the concurrent loader (R2)** and update `helper/docs/device_ram.md` if peak moved.
+3. **Round-trip one tool per shipped MLX model with an integer / nested-object parameter (R3).**
+4. `helper/docs/mlx-swift.md` "Models currently patched" now reads **None** — keep it in sync on the next merge, and note that `chunkedVLMPrefill` survives only for `testcases/MLXVLMLongPromptTests.swift` and as the escape hatch for the next single-shot model upstream ships.
+5. **Not adopted:** the variance-normalized KV cache (#329) is explicitly slower on decode and aimed at memory-bound long context; the reranker API (#375), LoRA dropout (#541) and q4_0 lattice calibration (#507) are training/retrieval features with no current consumer here.
