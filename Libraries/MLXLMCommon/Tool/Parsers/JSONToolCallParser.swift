@@ -7,9 +7,11 @@ import Foundation
 public struct JSONToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    public let supportsBareJSON: Bool
     private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
 
-    public init(startTag: String, endTag: String) {
+    public init(startTag: String, endTag: String, supportsBareJSON: Bool = false) {
+        self.supportsBareJSON = supportsBareJSON
         self.startTag = startTag
         self.endTag = endTag
     }
@@ -17,30 +19,44 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         guard let start = startTag, let end = endTag else { return nil }
 
-        // Find the JSON content between tags
-        var text = content
-
-        // Strip tags if present
-        if let startRange = text.range(of: start) {
-            text = String(text[startRange.upperBound...])
+        var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A bare JSON payload may contain literal protocol markers in its
+        // strings. Only wrapper tags outside that payload are delimiters.
+        if !text.hasPrefix("{"), let startRange = text.range(of: start) {
+            text = String(text[startRange.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
         }
-        if let endRange = text.range(of: end) {
-            text = String(text[..<endRange.lowerBound])
+        if text.hasSuffix(end) {
+            text.removeLast(end.count)
         }
 
-        let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // wangqi modified 2026-03-10 (merged 2026-07-03, re-merged 2026-08-10 / 2026-08-31):
-        // after upstream's own JSON recovery, fall back to the XMLFunction format for models
-        // (e.g. Qwen3.5-2B) that emit <function=name><parameter=key>value</parameter></function>
-        // inside <tool_call> tags. The two recoveries are disjoint: upstream's handles malformed
-        // JSON, the fork's handles a wholly different syntax nested in JSON tags.
+        // wangqi modified 2026-03-10 (merged 2026-07-03, re-merged 2026-08-10 / 2026-08-31 /
+        // 2026-09-18): after upstream's own JSON recovery, fall back to the XMLFunction format
+        // for models (e.g. Qwen3.5-2B) that emit
+        // <function=name><parameter=key>value</parameter></function> inside <tool_call> tags.
+        // The two recoveries are disjoint: upstream's handles malformed JSON, the fork's handles
+        // a wholly different syntax nested in JSON tags.
         // The declared-tool authorization the fork used to repeat here is gone: upstream moved it
         // into ToolCallProcessor.allowedToolNames, which rejects an undeclared name for every
         // parser rather than only this one.
-        return parseToolCall(from: jsonStr)
-            ?? parseRedundantOuterBraces(from: jsonStr)
-            ?? XMLFunctionParser().parse(content: content, tools: tools)
+        // The fallback is applied here rather than inside parsePayload because it needs the
+        // framed content: upstream's XMLFunctionParser now demands a payload that *starts* with
+        // <function= (QwenXMLPayloadScanner.framedPayload), where the pre-2026-09-18 parser
+        // searched anywhere in the string. Handing it the original content plus this format's
+        // tags lets it do its own framing, and keeps parsePayload the pure JSON entry point that
+        // Qwen35ToolCallParser calls.
+        return parsePayload(text)
+            ?? XMLFunctionParser(startTag: start, endTag: end).parse(
+                content: content, tools: tools)
+    }
+
+    /// Parse an already-extracted JSON payload without searching for protocol
+    /// delimiters again. Framing-aware callers use this after finding the
+    /// structural outer close, so a literal end-tag string inside an argument
+    /// remains JSON data rather than truncating the payload.
+    func parsePayload(_ payload: String) -> ToolCall? {
+        let json = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        return parseToolCall(from: json) ?? parseRedundantOuterBraces(from: json)
     }
 
     /// Some Qwen chat templates emit an EOS-delimited JSON call with a
