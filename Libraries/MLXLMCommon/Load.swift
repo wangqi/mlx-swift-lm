@@ -418,7 +418,10 @@ public func loadWeights(
         // Validate bits before quantizing to avoid a fatal error from the MLX C++ layer.
         // Supported bits are 2, 3, 4, 5, 6 and 8.
         // wangqi modified 2026-03-31
-        let supportedBits: Set<Int> = [2, 3, 4, 5, 6, 8]
+        // Admit bits=1: the self-managed thirdparty/mlx fork (prism-1bit-0.31.1) carries the
+        // PrismML 1-bit affine-quantization patch, so affine_quantize accepts bits=1 and this
+        // allow-list is what now rejects it, not the C++ layer. // wangqi modified 2026-09-17
+        let supportedBits: Set<Int> = [1, 2, 3, 4, 5, 6, 8]
         var bitsToCheck: [Int] = []
         if let q = quantization { bitsToCheck.append(q.bits) }
         if let plq = perLayerQuantization {

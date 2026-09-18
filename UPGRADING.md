@@ -80,7 +80,28 @@ place with `// wangqi modified YYYY-MM-DD`, so `git diff` against the upstream t
 The rest of the fork surface is: `fallbackToolCallParser` threading (Evaluate → ToolCallFormat →
 StandardTokenStreamDecoder → ToolCallProcessor), the `pendingOutput` invisible-start-tag buffer, the
 Pythonic JSON fallback, `Gemma4FunctionParser`, `ModelLoadError.directoryNotAccessible`, the
-`QuantizationBitsError` guard, MLXLogCollector tracing, and the two ChatSession changes below.
+`QuantizationBitsError` guard (see below — **it must keep admitting bits=1**), MLXLogCollector
+tracing, and the two ChatSession changes below.
+
+### `Libraries/MLXLMCommon/Load.swift` — `supportedBits` must include 1 (2026-09-17)
+
+```swift
+let supportedBits: Set<Int> = [1, 2, 3, 4, 5, 6, 8]
+```
+
+Added 2026-03-31 as `[2, 3, 4, 5, 6, 8]`, to stop the then-unpatched C++ layer from hard-crashing on
+an unsupported width. It became wrong on 2026-06-22, when `thirdparty/mlx` (`prism-1bit-0.31.1`)
+gained the PrismML patch and `affine_quantize` started accepting `bits=1` — the allow-list kept
+rejecting a case the kernels handled, and because `QuantizationBitsError.errorDescription` reproduces
+upstream's wording verbatim ("The supported bits are 2, 3, 4, 5, 6 and 8") the throw read as a
+*kernel* failure for three months. Widened 2026-09-17; `Bonsai-4B-mlx-1bit` then loaded and generated
+correctly at 50.4 tok/s decode.
+
+**On upgrade:** if a merge restores the upstream-shaped list, or drops the guard and lets the C++
+layer throw, 1-bit model loading breaks again with a message that blames the kernels.
+`testcases/ai/BonsaiLowBitInferenceTests.testBinary4BInferenceCoherentAndBenchmarks` is the gate —
+run it on macOS/Metal after any merge that touches `Load.swift`. Keep the guard (it is still correct
+for widths a future base genuinely will not support); just keep `1` in the set.
 
 ### `Libraries/MLXLMCommon/ChatSession.swift` (2026-08-24)
 
