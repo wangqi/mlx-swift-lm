@@ -74,7 +74,7 @@ place with `// wangqi modified YYYY-MM-DD`, so `git diff` against the upstream t
 > **No `MLXVLM/Models/*.swift` file is fork-patched any more (since 2026-08-31).** Qwen3VL and
 > GlmOcr, the last two `chunkedVLMPrefill` holdouts, were retired when upstream PR #475 gave each of
 > them its own windowed `prepareContinuation`. `Libraries/MLXLMCommon/ChunkedPrefill.swift` stays:
-> `testcases/MLXVLMLongPromptTests.swift` exercises its slicing math directly, and it is the escape
+> `testcases/engines/local/MLXVLMLongPromptTests.swift` (macOS only) exercises its slicing math directly, and it is the escape
 > hatch for the next model upstream leaves single-shot.
 
 The rest of the fork surface is: `fallbackToolCallParser` threading (Evaluate → ToolCallFormat →
@@ -242,7 +242,20 @@ byte-identical across `tag-20260918` → `tag-20260928`). MLX model regression s
 (`helper/scripts/model_regression/run_model_tests.py --mlx-only`, Swift engine): plain 14 passed / 0
 failed / 2 skipped (`fixed: LFM2.5-2.6B-4bit` against `20260918-113733`); tool-call 11 / 1 / 4
 (`fixed: LFM2.5-2.6B-4bit`; the one failure, `MiniCPM5-1B-4bit` "no tool call emitted", is
-unchanged from `20260918-114710`).
+unchanged from `20260918-114710`). App suites in `testcases/engines/local/` on the iOS simulator:
+`MLXAssistantReplayTests` 4, `MLXFinalStatsTests` 10, `MLXKVCacheEstimateTests` 14,
+`MLXMemoryBudgetTests` 22, `MLXPromptCacheReuseTests` 33, `LocalEngineStreamStrippingTests` 15,
+`LocalOutputCapPrecedenceTests` 9, `LocalClientStatusFieldsTests` 29,
+`BackgroundLocalModelIsolationTests` 6 (+1 skip), `LoadAIChatModelFreeingTests` 6,
+`BonsaiImageMemoryEnvelopeTests` 3, `LocalModelBenchmarkPOCTests` 2 (+1 skip): all green. On macOS
+(Metal): `BonsaiLowBitInferenceTests` 3/3, covering the 1-bit and both 2-bit ternary models.
+`MLXVLMLongPromptTests` had never run before 2026-09-28: the file was never in `project.pbxproj`.
+It is now wired into `AIAssistantUnitTests` and `AIAssistantMacUnitTests`. **Run it on macOS**,
+because its slicing-math cases build `MLXArray`s, and on the simulator that aborts the test host
+(it now skips there instead):
+`xcodebuild test -project AIAssistant.xcodeproj -scheme AIAssistantMacUnitTests -destination
+"platform=macOS" -only-testing:AIAssistantMacUnitTests/MLXVLMLongPromptTests`. First run: the six
+`ChunkedPrefill.swift` math cases passed; the 12 model cases are env-gated placeholders and skip.
 
 Last full run (all three steps): 2026-09-18 — all steps green. `Package.resolved` `ml-explore/mlx-swift` count 0;
 iOS scheme BUILD SUCCEEDED; macOS scheme BUILD SUCCEEDED; `QuantizationTests` **5/5 passed**
