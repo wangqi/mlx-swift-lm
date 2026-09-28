@@ -71,6 +71,10 @@ public struct LFM2Configuration: Codable, Sendable {
         case ropeParameters = "rope_parameters"
     }
 
+    private enum AliasCodingKeys: String, CodingKey {
+        case intermediateSize = "intermediate_size"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
@@ -87,7 +91,11 @@ public struct LFM2Configuration: Codable, Sendable {
         self.convBias = try container.decodeIfPresent(Bool.self, forKey: .convBias) ?? false
         self.convLCache = try container.decodeIfPresent(Int.self, forKey: .convLCache) ?? 3
         self._blockDim = try container.decodeIfPresent(Int.self, forKey: ._blockDim)
-        self._blockFFDim = try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+        // Newer configs (LFM2.5-2.6B) carry only `intermediate_size`. wangqi modified 2026-09-28
+        let aliases = try decoder.container(keyedBy: AliasCodingKeys.self)
+        self._blockFFDim =
+            try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+            ?? aliases.decodeIfPresent(Int.self, forKey: .intermediateSize)
         self.blockMultipleOf =
             try container.decodeIfPresent(Int.self, forKey: .blockMultipleOf) ?? 256
         self.blockFFNDimMultiplier =
@@ -383,8 +391,15 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitizedWeights: [String: MLXArray] = [:]
 
-        for (name, param) in weights {
+        for (rawName, param) in weights {
             var sanitizedParam = param
+
+            // Some text-only checkpoints (LFM2.5-2.6B-4bit) prefix every key `language_model.`.
+            // wangqi modified 2026-09-28
+            var name = rawName
+            if name.hasPrefix("language_model.") {
+                name = String(name.dropFirst("language_model.".count))
+            }
 
             if name.contains("conv.weight") {
                 if param.shape[param.shape.count - 1] > param.dim(1) {
