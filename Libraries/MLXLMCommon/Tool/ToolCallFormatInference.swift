@@ -41,6 +41,13 @@ extension ToolCallFormat {
         Signature(.gemma4, allOf: "<|tool_call>", "<tool_call|>"),
         Signature(.gemma, allOf: "<start_function_call>"),
         Signature(.glm4, allOf: "<arg_key>"),
+        // wangqi modified 2026-10-18
+        Signature(
+            .minicpm5,
+            anyOf: [
+                [#"<function name=""#, #"<param name=""#],
+                [#"<function name=\""#, #"<param name=\""#],
+            ]),
         Signature(.lfm2, allOf: "<|tool_list_start|>"),
         Signature(
             .xmlFunction, anyOf: [["<tool_call>\n<function="], [#"<tool_call>\n<function="#]]),
@@ -64,6 +71,7 @@ extension ToolCallFormat {
     public init?(toolParserType name: String) {
         switch name.lowercased() {
         case "minimax_m2": self = .minimaxM2
+        case "minicpm5": self = .minicpm5  // wangqi modified 2026-10-18
         case "gemma4": self = .gemma4
         case "function_gemma", "gemma": self = .gemma
         case "glm4", "glm47": self = .glm4

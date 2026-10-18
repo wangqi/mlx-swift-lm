@@ -78,6 +78,20 @@ must keep admitting bits=1**), MLXLogCollector tracing, and the two ChatSession 
 > init parameter with no conflict marker; it was re-added in the new file. Expect upstream to keep
 > moving code; diff a deleted block against the merge base before taking upstream's side.
 
+### `.minicpm5` tool-call format — `MiniCPM5FunctionParser.swift` (new) + `ToolCallFormat.swift` + `ToolCallFormatInference.swift` (2026-10-18)
+
+MiniCPM5 declares `model_type: "llama"` with a 130,560-token vocabulary, so `LlamaModel.toolCallFormat`
+(`MLXLLM/Models/Llama.swift`, vocabulary >= 128,000) guessed `.llama3`. Its inline-JSON parser never
+reads `<function name="f"><param name="k">v</param></function>` and never consults the fallback
+parser, so every MiniCPM5 call was dropped (regression tool-call probe FAIL since 2026-09-28). The
+fork adds: a `.minicpm5` case using `MiniCPM5FunctionParser` (start `<function name=`, end
+`</function>`, unwraps the `<![CDATA[...]]>` values the template asks for); a template signature
+(`<function name="` with `<param name="`, plain or escaped quotes) so `resolved()` replaces the
+Llama 3 guess; and `tool_parser_type` `"minicpm5"`. **On upgrade:** keep the case in the three
+ordinary-format switch lists in `ToolCallFormat.swift`; drop the patch only if upstream ships its
+own MiniCPM5 format. Gate: `-only-testing:MLXLMTests/MiniCPM5FunctionParserTests` plus the MLX
+tool-call probe on `MiniCPM5-1B-4bit`.
+
 ### `Libraries/MLXLMCommon/Tool/Parsers/Gemma4FunctionParser.swift` — delegate native syntax (2026-10-17)
 
 The fork keeps its own `.gemma4` parser only for the double-brace JSON that the Gemma 4 chat

@@ -118,6 +118,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    // wangqi modified 2026-10-18
+    /// MiniCPM5 function format with name attributes.
+    /// Example: `<function name="f"><param name="k">v</param></function>`
+    case minicpm5
+
     /// Muse Glimmer's Onyx ATEM invoke/parameter format.
     /// Example: `<atem:function_calls><atem:invoke name="f">...</atem:invoke></atem:function_calls>`
     case atem
@@ -170,6 +175,9 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minicpm5:
+            // wangqi modified 2026-10-18
+            return MiniCPM5FunctionParser()
         case .atem:
             return ATEMToolCallParser()
         case .mistral:
@@ -232,6 +240,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 toolCallPolicy: toolCallPolicy)
 
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .minicpm5,
             .mistral, .llama3:
             return nil
         }
@@ -254,6 +263,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .minicpm5,
             .mistral,
             .llama3:
             return []
@@ -276,6 +286,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 }
             }
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .minicpm5,
             .mistral, .llama3:
             0
         }
