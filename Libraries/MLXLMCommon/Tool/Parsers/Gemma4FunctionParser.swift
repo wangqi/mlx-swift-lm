@@ -14,6 +14,10 @@ public struct Gemma4FunctionParser: ToolCallParser, Sendable {
 
     private let escapeMarker = "<|\"|>"
 
+    private var nativeParser: GemmaFunctionParser {
+        GemmaFunctionParser(startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: escapeMarker)
+    }
+
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -61,46 +65,9 @@ public struct Gemma4FunctionParser: ToolCallParser, Sendable {
             }
         }
 
-        var arguments: [String: any Sendable] = [:]
-
-        // Fall back to native Gemma key:value parsing
-        while !argsStr.isEmpty {
-            // Find the key (everything before :)
-            guard let colonIdx = argsStr.firstIndex(of: ":") else { break }
-            let key = String(argsStr[..<colonIdx])
-            argsStr = String(argsStr[argsStr.index(after: colonIdx)...])
-
-            // Handle Gemma 4 escaped strings (uses <|"|> as delimiter)
-            if argsStr.hasPrefix(escapeMarker) {
-                argsStr = String(argsStr.dropFirst(escapeMarker.count))
-                guard let endEscape = argsStr.range(of: escapeMarker) else { break }
-                let value = String(argsStr[..<endEscape.lowerBound])
-                arguments[key] = value
-                argsStr = String(argsStr[endEscape.upperBound...])
-                // Skip comma if present
-                if argsStr.hasPrefix(",") {
-                    argsStr = String(argsStr.dropFirst())
-                }
-                continue
-            }
-
-            // Handle regular values (until comma or end)
-            let commaIdx = argsStr.firstIndex(of: ",") ?? argsStr.endIndex
-            let value = String(argsStr[..<commaIdx])
-            argsStr =
-                commaIdx < argsStr.endIndex
-                ? String(argsStr[argsStr.index(after: commaIdx)...]) : ""
-
-            // Try JSON decode, fallback to string
-            if let data = value.data(using: .utf8),
-                let json = deserializeJSON(data)
-            {
-                arguments[key] = json
-            } else {
-                arguments[key] = value
-            }
-        }
-
-        return ToolCall(function: .init(name: funcName, arguments: arguments))
+        // Native key:value syntax goes to upstream's parameterized parser, which reads nested
+        // objects and arrays against the tool schema (#626). The fork's own scalar-only loop
+        // turned those into raw strings. wangqi modified 2026-10-17
+        return nativeParser.parse(content: content, tools: tools)
     }
 }

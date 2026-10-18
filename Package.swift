@@ -43,6 +43,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXScriptedLM",
+            targets: ["MLXScriptedLM"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -65,10 +68,10 @@ let package = Package(
         // patch (thirdparty/mlx-swift -> wangqi/mlx-swift); taken out of SwiftPM GitHub
         // resolution. The app's root-level XCLocalSwiftPackageReference override pins the
         // same path for mlx-audio-swift too. See helper/docs/mlx-swift.md.
-        // Upstream requires mlx-swift .upToNextMinor(from: "0.31.6") as of this merge
-        // (was 0.31.4) — the fork must be rebased onto that base and the PrismML delta
-        // re-applied before this pin is considered satisfied.
-        // wangqi modified 2026-06-22 / 2026-08-31
+        // Upstream requires mlx-swift .upToNextMinor(from: "0.32.3") as of this merge
+        // (was 0.31.6; #646 / #657) — the fork must be rebased onto that base and the PrismML
+        // delta re-applied before this pin is considered satisfied.
+        // wangqi modified 2026-06-22 / 2026-08-31 / 2026-10-17
         .package(path: "../mlx-swift"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
@@ -163,6 +166,17 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+
+        // Scripted tokenizers and models
+        .target(
+            name: "MLXScriptedLM",
+            dependencies: [
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXScriptedLM",
+            exclude: ["README.md"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -174,6 +188,7 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                "MLXScriptedLM",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
