@@ -17,11 +17,13 @@ starting from. Update this file on every upgrade (it is part of the `mlx-swift-l
 | Repo | Remote (origin) | Branch | HEAD | Role |
 |------|-----------------|--------|------|------|
 | `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20261017` | `9d6b496` (merge) | LLM/VLM layer (the package upgraded every 7-10 days) |
-| `thirdparty/mlx-swift`    | `wangqi/mlx-swift` (+ `upstream` = `ml-explore/mlx-swift`) | `prism-1bit-0.32.3` | `2a7e24b` | Swift API + vendored mlx-core; carries the PrismML patch |
-| `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`, `upstream` = `ml-explore/mlx`) | `prism-1bit-0.32.2` | `7591f4029` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
+| `thirdparty/mlx-swift`    | `wangqi/mlx-swift` (+ `upstream` = `ml-explore/mlx-swift`) | `main` (= `prism-1bit-0.32.3`) | `2a7e24b` | Swift API + vendored mlx-core; carries the PrismML patch |
+| `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`, `upstream` = `ml-explore/mlx`) | `main` (= `prism-1bit-0.32.2`) | `7591f4029` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
 
-The previous branches (`prism-1bit-0.31.4` @ `37b3ca1`, `prism-1bit-0.31.1` @ `48db7fe5`) are kept for rollback.
-`prism-1bit-0.32.2` must be pushed to `wangqi/mlx` before the mlx-swift gitlink resolves on another machine.
+Since 2026-10-17 `main` in both forks is the PrismML line: it was a stale June snapshot of upstream `main` and an
+ancestor of the `prism-1bit-*` branches, so it was fast-forwarded to them. It no longer mirrors upstream; a future
+move still branches `prism-1bit-<ver>` off the new release tag and fast-forwards or merges `main` afterwards. The
+previous branches (`prism-1bit-0.31.4` @ `37b3ca1`, `prism-1bit-0.31.1` @ `48db7fe5`) are kept for rollback.
 
 ### Engine version surfaced in the app
 - `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20261017"` (`views/settings/models/LocalModelAboutView.swift`).
@@ -266,9 +268,9 @@ one failure is still `MiniCPM5-1B-4bit` "no tool call emitted"); the 1-bit and t
 modes. Audio (`run_audio_tests.py`) 19/19. FLUX.2 parity on macOS 55/55, none skipped: full 25-block
 transformer 6.48e-3 relative RMS (was 6.5e-3), end-to-end vs. the golden max 141 / mean 1.85 / p99 13 (was
 155 / 2.20 / 14), 16x16 block-mean difference 1.2458 (was 1.5583). The heavy image suites skip unless the
-checkpoint sits at the path `testcases/imagegen/fixtures/manifest.json` records
-(`~/disk/projects/ai/Bonsai-image-demo/models/...`, deleted); it was run through a temporary link to
-`/Volumes/ssd2t/mlximages/bonsai-image-4B-binary-mlx`.
+checkpoint sits at the path `testcases/imagegen/fixtures/manifest.json` records. Since 2026-10-17 that is
+`/Volumes/ssd2t/mlximages/bonsai-image-4B-binary-mlx` (it pointed at the deleted
+`~/disk/projects/ai/Bonsai-image-demo/models/`); re-run without any link: 55/55, none skipped.
 
 Previous partial run: 2026-09-28 — steps 1 and 2 green: `Package.resolved` `ml-explore/mlx-swift` count 0,
 iOS scheme (iPhone 18 Pro Max simulator) BUILD SUCCEEDED, macOS scheme BUILD SUCCEEDED. Step 3
