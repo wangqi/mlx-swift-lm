@@ -3,7 +3,7 @@
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
 starting from. Update this file on every upgrade (it is part of the `mlx-swift-lm-upgrade` skill's deliverables).
 
-**Last updated:** 2026-09-28
+**Last updated:** 2026-10-17
 
 > These three are **independent local git repos** under `thirdparty/` (not app submodules). The app
 > (`AIAssistant.xcodeproj`) wires them as local SwiftPM packages; a root-level `XCLocalSwiftPackageReference` for
@@ -16,12 +16,15 @@ starting from. Update this file on every upgrade (it is part of the `mlx-swift-l
 
 | Repo | Remote (origin) | Branch | HEAD | Role |
 |------|-----------------|--------|------|------|
-| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20260928` | `2495a6f` | LLM/VLM layer (the package upgraded every 7-10 days) |
-| `thirdparty/mlx-swift`    | `wangqi/mlx-swift`    | `prism-1bit-0.31.4` | `37b3ca1` | Swift API + vendored mlx-core; carries the PrismML patch |
-| `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`) | `prism-1bit-0.31.1` | `48db7fe5` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
+| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `tag-20261017` | `9d6b496` (merge) | LLM/VLM layer (the package upgraded every 7-10 days) |
+| `thirdparty/mlx-swift`    | `wangqi/mlx-swift` (+ `upstream` = `ml-explore/mlx-swift`) | `prism-1bit-0.32.3` | `2a7e24b` | Swift API + vendored mlx-core; carries the PrismML patch |
+| `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`, `upstream` = `ml-explore/mlx`) | `prism-1bit-0.32.2` | `7591f4029` | mlx-core C++ fork; holds the PrismML 1-bit/2-bit patch |
+
+The previous branches (`prism-1bit-0.31.4` @ `37b3ca1`, `prism-1bit-0.31.1` @ `48db7fe5`) are kept for rollback.
+`prism-1bit-0.32.2` must be pushed to `wangqi/mlx` before the mlx-swift gitlink resolves on another machine.
 
 ### Engine version surfaced in the app
-- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20260928"` (`views/settings/models/LocalModelAboutView.swift`).
+- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20261017"` (`views/settings/models/LocalModelAboutView.swift`).
 
 ---
 
@@ -31,38 +34,23 @@ starting from. Update this file on every upgrade (it is part of the `mlx-swift-l
 
 | Axis | Value | Where it lives |
 |------|-------|----------------|
-| **Swift-package version** (git tag / API surface) | **0.31.4** (`dc43e62`) + the #429 cherry-pick (`37b3ca1`) | the `mlx-swift` release commit our fork branch `prism-1bit-0.31.4` is based on. Upstream `mlx-swift-lm` now pins `.upToNextMinor(from: "0.31.6")` (#484, "*.4 was missing new API that the current code calls*") — **that API is #429**, `DType.greatestFiniteMagnitudeArray` + `MLXArray.maskFill`, which this fork already carries as the additive cherry-pick taken 2026-07-22. See "Why 0.31.6 does not force a move" below |
-| **Vendored mlx-core (C++)** | **0.31.1** (`ce45c52`) | `thirdparty/mlx-swift/Source/Cmlx/mlx` submodule + `mlx/version.h` (`MLX_VERSION 0.31.1`); = PrismML's patch base |
+| **Swift-package version** (git tag / API surface) | **0.32.3** (`1960120`) | the `mlx-swift` release tag our fork branch `prism-1bit-0.32.3` is based on. Upstream `mlx-swift-lm` pins `.upToNextMinor(from: "0.32.3")` (#646, #657) |
+| **Vendored mlx-core (C++)** | **v0.32.2** (`1f8e74e`) | `thirdparty/mlx-swift/Source/Cmlx/mlx` gitlink + `mlx/version.h` (`MLX_VERSION 0.32.2`); the base of `thirdparty/mlx` `prism-1bit-0.32.2` |
 
-A 0.31.1 core backs a 0.31.4 Swift API. Keep the **core at the PrismML base (0.31.1)** and base the **Swift sources
-on the 0.31.4 release** unless upstream forces a move.
+An older core can back a newer Swift API, so check both axes on every merge: the required tag can move the core
+too (`git -C thirdparty/mlx-swift ls-tree <tag> Source/Cmlx/mlx`). 0.32.3 did, which is why 2026-10-17 moved both.
 
-### Why the Swift sources are based on the 0.31.4 *release* (`dc43e62`), not `mlx-swift` `main`
-`mlx-swift` `main` HEAD (`e23ae6b`) is past 0.31.4 and ships a CUDA build-tool plugin `Source/Encuda` that uses
-`Foundation.Process` — `API_UNAVAILABLE` on iOS — which hard-fails the iOS build (`cannot find type 'Process'`).
-The tagged 0.31.4 release has no `Encuda` target, so it is the safe base.
+### Base on the release tag, not `mlx-swift` `main`
+Releases are the tested combination of Swift sources, mlx-c and mlx-core. The iOS blocker that first forced this
+rule, the `Source/Encuda` CUDA plugin (`Foundation.Process`, `API_UNAVAILABLE` on iOS), is behind `#if os(Linux)`
+in `Package.swift` since 0.32.x (#437, #447), so it no longer breaks the iOS build. Check the gate is still there on
+each move.
 
-Upstream mlx-swift has since fixed exactly that (PR #437, "guard use of Process — does not build on iOS", `0bb916c`,
-in 0.31.6), which corroborates the diagnosis above and removes the blocker for a *future* move. It is not a reason to
-move now — see below.
-
-### Why 0.31.6 does not force a move (audited 2026-08-31)
-`mlx-swift-lm` PR #484 raised its requirement to `0.31.6` because the merged code calls `MLXArray.maskFill(for:)` and
-the `DType.finfo` extensions (`KVCache.swift`, `ThinkingBudget.swift`). Those are **#429**, already on
-`prism-1bit-0.31.4` at `37b3ca1`. Auditing the rest of `prism-1bit-0.31.4 → 0.31.6`, nothing else is reachable from
-`mlx-swift-lm` or the app:
-
-| Delta | Reachable from us? |
-|---|---|
-| #429 `MLXArray.maskFill` / `DType.finfo` | **yes — already cherry-picked** |
-| #413 Linux + CUDA SPM support (`Source/Encuda`, `GPU+CUDA.swift`, `CudaBuild.json`, `cuda_jit_sources.h`, and all 347 lines of `MLXFastKernel.swift` churn) | no — the kernel file is only `#if`-split; the Apple-platform API surface is unchanged, and this fork has no `Source/Encuda` target at all |
-| #437 "guard use of Process" | no — only touches `Source/Encuda`, which #413 introduced |
-| #431 MultiOptimizer, #432 Muon, #433 LR schedules | no — training-only optimizers, no consumer in `mlx-swift-lm` or the app |
-| #434 `.complex64` moved to the float32 `finfo` branch | no — complex64 unused |
-| #422 `Device` default resolved from the C++ core instead of hard-coded `.gpu` | no — only changes CPU-only hosts (Linux without CUDA, no Metal); Apple + Metal resolves to GPU either way |
-
-Verified by build rather than by reading alone: `swift build`, the iOS scheme and the macOS scheme all compile
-against the local 0.31.4-based fork with upstream's 0.31.6-requiring sources.
+### History of the axes
+- 2026-06-22 → 2026-10-16: Swift `0.31.4` (`dc43e62`, + #429 cherry-pick `37b3ca1` from 2026-07-22) on core `0.31.1`
+  (`ce45c52`). Upstream's 2026-08-31 move to `0.31.6` did not force a fork move: the only reachable API was #429.
+- 2026-10-17: Swift `0.32.3` / core `v0.32.2`. Forced by `MLXLogger` (0.32.x), first seen as
+  `cannot find 'MLXLogger' in scope` when building the merged code against the 0.31.4 fork.
 
 ---
 
@@ -77,11 +65,26 @@ place with `// wangqi modified YYYY-MM-DD`, so `git diff` against the upstream t
 > `testcases/engines/local/MLXVLMLongPromptTests.swift` (macOS only) exercises its slicing math directly, and it is the escape
 > hatch for the next model upstream leaves single-shot.
 
-The rest of the fork surface is: `fallbackToolCallParser` threading (Evaluate → ToolCallFormat →
-StandardTokenStreamDecoder → ToolCallProcessor), the `pendingOutput` invisible-start-tag buffer, the
-Pythonic JSON fallback, `Gemma4FunctionParser`, `ModelLoadError.directoryNotAccessible`, the
-`QuantizationBitsError` guard (see below — **it must keep admitting bits=1**), MLXLogCollector
-tracing, and the two ChatSession changes below.
+The rest of the fork surface is: `fallbackToolCallParser` threading (Evaluate → `TokenLoopHandler.swift`
+`TextToolTokenLoopHandler` → ToolCallFormat → StandardTokenStreamDecoder → ToolCallProcessor), the
+`pendingOutput` invisible-start-tag buffer, the Pythonic JSON fallback, `Gemma4FunctionParser` (see
+below), `ModelLoadError.directoryNotAccessible`, the `QuantizationBitsError` guard (see below — **it
+must keep admitting bits=1**), MLXLogCollector tracing, and the two ChatSession changes below.
+
+> **2026-10-17: upstream #640 moved `TextToolTokenLoopHandler` out of `Evaluate.swift` into
+> `TokenLoopHandler.swift`.** Taking upstream's side of that hunk dropped the fork's `fallbackParser`
+> init parameter with no conflict marker; it was re-added in the new file. Expect upstream to keep
+> moving code; diff a deleted block against the merge base before taking upstream's side.
+
+### `Libraries/MLXLMCommon/Tool/Parsers/Gemma4FunctionParser.swift` — delegate native syntax (2026-10-17)
+
+The fork keeps its own `.gemma4` parser only for the double-brace JSON that the Gemma 4 chat
+template produces when it re-injects tool-call history (`call:f{{"k":"v"}}`). Its own scalar-only
+key:value loop hid upstream #626 (nested objects and arrays read against the tool schema). It now
+tries the JSON fallback first and hands everything else to `GemmaFunctionParser(startTag:
+"<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)`. **On upgrade:** keep the
+delegation; re-add nothing to the fork's own loop. Gate: `swift test --filter ToolTests`
+(upstream's nested Gemma 4 tests plus the fork's double-brace / bare-value tests).
 
 ### `Libraries/MLXLMCommon/Load.swift` — `supportedBits` must include 1 (2026-09-17)
 
@@ -96,6 +99,12 @@ rejecting a case the kernels handled, and because `QuantizationBitsError.errorDe
 upstream's wording verbatim ("The supported bits are 2, 3, 4, 5, 6 and 8") the throw read as a
 *kernel* failure for three months. Widened 2026-09-17; `Bonsai-4B-mlx-1bit` then loaded and generated
 correctly at 50.4 tok/s decode.
+
+**2026-10-17:** upstream #679 replaced the inline quantize with component-aware loading
+(`prepareComponents` → `loadModelCheckpoint` → `prepareCheckpoint` → `applyCheckpoint`) and folds
+`quantization` into `perLayerQuantization`. The guard now runs on that merged value **before**
+`prepareComponents`, so components loaded on first use (#580) are covered too, and the error text
+lists 1-bit.
 
 **On upgrade:** if a merge restores the upstream-shaped list, or drops the guard and lets the C++
 layer throw, 1-bit model loading breaks again with a message that blames the kernels.
@@ -143,9 +152,9 @@ slowdown into an uncatchable process abort.
    and asserts a rebuild; the fork reuses, so the fork's copy is renamed
    `testExactPrefixReuseWithAnAllOnesMaskIsNotVetoed` and asserts the suffix is smaller than the
    rendered prompt. Expect this collision on every future merge. Upstream removed the mask from
-   Qwen3-VL itself in PR #549, but **FastVLM, Pixtral, Idefics3, SmolVLM2, Mistral3, MuseGlimmer,
-   GlmOcr, Gemma4 and PaliGemma still attach one**, so the relaxation remains load-bearing — do not
-   "resolve" this by taking upstream's assertion.
+   Qwen3-VL itself in PR #549, and from FastVLM, Gemma 3, Gemma 4, Mistral 3 and SmolVLM in #700
+   (2026-10-17), but **Pixtral, Idefics3, MuseGlimmer, GlmOcr and PaliGemma still attach one**, so the
+   relaxation remains load-bearing — do not "resolve" this by taking upstream's assertion.
 
 2. **The reduced input preserves the rank `prepare` produced.** All three reuse branches built
    `LMInput(tokens: MLXArray(Array(promptTokenIds[...])))`, which is always 1-D because the ids came
@@ -189,20 +198,27 @@ ships one `model.safetensors` alongside a stale index naming two shards.
 
 ## PrismML 1-bit/2-bit quantization patch
 
-- **`thirdparty/mlx` branch `prism-1bit-0.31.1`** (off `ce45c52`): cherry-pick of `PrismML-Eng/mlx` `ce45c52..d90771c`
-  (3 commits, quantization path only — `mlx/ops.cpp`, `mlx/primitives.cpp`, `backend/cpu/quantized.cpp`,
-  `backend/metal/quantized.cpp`, `backend/metal/jit_kernels.cpp`, `backend/metal/kernels/quantized*.{h,metal}`,
-  `quantized_nax*.{h,metal}`, python bindings/tests, benchmarks). See `thirdparty/mlx/PRISM-PATCH.md`.
-- **`thirdparty/mlx-swift` branch `prism-1bit-0.31.4`** (off `dc43e62`, plus the additive #429 cherry-pick
-  `37b3ca1` taken 2026-07-22): `Source/Cmlx/mlx` gitlink → `48db7fe5`;
-  4 regenerated `Source/Cmlx/mlx-generated/` quantized files (`metal/quantized.h`, `metal/quantized_nax.h`,
-  `quantized.cpp`, `quantized_nax.cpp`); `.gitmodules` url → `wangqi/mlx`; `Package.swift`
-  `.define("FMT_CONSTEVAL", to: "")`.
-- **`thirdparty/mlx-swift-lm/Package.swift`**: `mlx-swift` dependency switched to `.package(path: "../mlx-swift")`.
+- **`thirdparty/mlx` branch `prism-1bit-0.32.2`** (off `1f8e74e`, v0.32.2): the 3 PrismML-Eng/mlx low-bit commits
+  cherry-picked (`729d37373`, `8cc09cb24`, `41bbd1896`), `PRISM-PATCH.md`, and `7591f4029`, which adds the
+  bias-free kernels to the core. Scope: quantization path only — `mlx/ops.cpp`, `mlx/primitives.cpp`,
+  `backend/cpu/quantized.cpp`, `backend/metal/quantized.cpp`, `backend/metal/jit_kernels.cpp`,
+  `backend/metal/kernels/quantized*.h`. Conflicts and their resolutions are listed in `PRISM-PATCH.md`.
+- **Bias-free (`affine_sym`) kernels live in the core since 2026-10-17.** Until then
+  `affine_sym_qmv_fast` / `affine_sym_qmv` / `sym_derived_bias` existed only in mlx-swift's generated
+  `mlx-generated/` files (PrismML's mlx-swift), so `tools/update-mlx.sh` would have deleted them with no build
+  error. Ported from PrismML-Eng/mlx `4fc91df60`. After every regeneration,
+  `grep -c affine_sym Source/Cmlx/mlx-generated/metal/quantized.h` must be >= 3.
+- **`thirdparty/mlx-swift` branch `prism-1bit-0.32.3`** (off the `0.32.3` tag `1960120`), commit `2a7e24b`:
+  `Source/Cmlx/mlx` gitlink → `7591f4029`; `Source/Cmlx/mlx-c` at the tag's `ebc88f1`; the 4
+  `Source/Cmlx/mlx-generated/` quantized files regenerated by `tools/update-mlx.sh` (nothing else changed);
+  `.gitmodules` url → `wangqi/mlx`; `Package.swift` `.define("FMT_CONSTEVAL", to: "")`; `QuantizationTests`.
+- **`thirdparty/mlx-swift-lm/Package.swift`**: `mlx-swift` dependency is `.package(path: "../mlx-swift")`.
 - **Regression guard:** the delta is additive + gated. bits≥2 host quantize, GPU quantize kernel, and matmul paths
-  are unchanged (only `if(bits==1)` branches inserted ahead of them). Proven by
-  `thirdparty/mlx-swift/Tests/MLXTests/QuantizationTests.swift` — `testBitExactRegression` (2/4/8-bit) and
-  `testLowBitReconstruction` (bits=1 binary round-trip; bits=1/2 matmul consistency).
+  are unchanged (only `if (bits == 1)` branches and the `bias_free` template default `false`). Proven by
+  `thirdparty/mlx-swift/Tests/MLXTests/QuantizationTests.swift` — `testBitExactRegression` (2/4/8-bit),
+  `testLowBitReconstruction` (bits=1 binary round-trip; bits=1/2 matmul consistency) and
+  `testBiasFreeLowBitMatchesDerivedBias` (`biases: nil` == the explicit derived bias on the `qmv_fast` and
+  plain `qmv` paths; the only coverage of the bias-free kernels).
 
 ---
 
@@ -214,8 +230,11 @@ ships one `model.safetensors` alongside a stale index naming two shards.
 | `thirdparty/mlx-audio-swift` | yes — `MLX`, `MLXNN`, `MLXFast` | pins `.upToNextMajor(from: "0.30.6")`, satisfied by the local override |
 | `thirdparty/llamacpp_swift` | no | `mlx-swift` dependency is commented out |
 | `thirdparty/WhisperKit` | no | only a comment mentions `mlx-swift` |
+| `libs/imagegen/` (FLUX.2, app code) | yes — imports `MLX` directly | runs the binary / ternary Bonsai image checkpoints through the 1/2-bit affine kernels |
 
-Both live consumers are gated by building the iOS + macOS schemes against the fork.
+All three are gated by building the iOS + macOS schemes against the fork. Behaviour is gated by the MLX model
+regression suite (`mlx-swift-lm`), `run_audio_tests.py` (`mlx-audio-swift`) and the `testcases/imagegen/` parity
+suites on macOS (FLUX.2).
 
 ---
 
@@ -227,15 +246,31 @@ xcodebuild -project AIAssistant.xcodeproj -scheme AIAssistant -resolvePackageDep
 grep -c 'ml-explore/mlx-swift' AIAssistant.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved  # must be 0
 
 # 2. Both schemes build (Xcode required for Metal shaders)
-xcodebuild -project AIAssistant.xcodeproj -scheme AIAssistant    -destination "platform=iOS Simulator,name=iPhone 17 Pro Max" build
+xcodebuild -project AIAssistant.xcodeproj -scheme AIAssistant    -destination "platform=iOS Simulator,name=iPhone 18 Pro Max" build
 xcodebuild -project AIAssistant.xcodeproj -scheme AIAssistantMac -destination "platform=macOS" build
 
 # 3. Bit-exact + low-bit gate (Metal needs Xcode; swift test will NOT build the metallib)
 cd thirdparty/mlx-swift
-xcodebuild test -scheme mlx-swift-Package -destination "platform=macOS" -only-testing:MLXTests/QuantizationTests
+xcodebuild test -scheme mlx-swift-Package -destination "platform=macOS" \
+  -derivedDataPath <scratch>/dd-mlxswift -only-testing:MLXTests/QuantizationTests
 ```
+Always pass `-derivedDataPath`: without it the products land in `thirdparty/mlx-swift/build`, and the next
+`tools/update-mlx.sh` fails on `mkdir build`.
 
-Last run: 2026-09-28 — steps 1 and 2 green: `Package.resolved` `ml-explore/mlx-swift` count 0,
+Last full run (all three steps + every consumer): 2026-10-17, after both axes moved — all green.
+`Package.resolved` `ml-explore/mlx-swift` count 0; macOS and iOS (iPhone 18 Pro Max simulator) BUILD SUCCEEDED;
+`QuantizationTests` **11/11** (the three PrismML gates plus upstream's NVFP4 global-scale cases); `mlx-swift-lm`
+`swift test --filter "ToolTests|TokenStreamDecoder|ChatTests"` 119 passed. MLX model regression (Swift engine):
+generate 15 / 0 / 2 and tool-call 12 / 1 / 4, both **identical** to `20260928-155436` / `20260928-154912` (the
+one failure is still `MiniCPM5-1B-4bit` "no tool call emitted"); the 1-bit and three 2-bit Bonsai LLMs pass both
+modes. Audio (`run_audio_tests.py`) 19/19. FLUX.2 parity on macOS 55/55, none skipped: full 25-block
+transformer 6.48e-3 relative RMS (was 6.5e-3), end-to-end vs. the golden max 141 / mean 1.85 / p99 13 (was
+155 / 2.20 / 14), 16x16 block-mean difference 1.2458 (was 1.5583). The heavy image suites skip unless the
+checkpoint sits at the path `testcases/imagegen/fixtures/manifest.json` records
+(`~/disk/projects/ai/Bonsai-image-demo/models/...`, deleted); it was run through a temporary link to
+`/Volumes/ssd2t/mlximages/bonsai-image-4B-binary-mlx`.
+
+Previous partial run: 2026-09-28 — steps 1 and 2 green: `Package.resolved` `ml-explore/mlx-swift` count 0,
 iOS scheme (iPhone 18 Pro Max simulator) BUILD SUCCEEDED, macOS scheme BUILD SUCCEEDED. Step 3
 (`QuantizationTests`) was not re-run because the PrismML patch base did not move (`Package.swift`
 byte-identical across `tag-20260918` → `tag-20260928`). MLX model regression suite
@@ -257,7 +292,7 @@ because its slicing-math cases build `MLXArray`s, and on the simulator that abor
 "platform=macOS" -only-testing:AIAssistantMacUnitTests/MLXVLMLongPromptTests`. First run: the six
 `ChunkedPrefill.swift` math cases passed; the 12 model cases are env-gated placeholders and skip.
 
-Last full run (all three steps): 2026-09-18 — all steps green. `Package.resolved` `ml-explore/mlx-swift` count 0;
+Previous full run (all three steps): 2026-09-18 — all steps green. `Package.resolved` `ml-explore/mlx-swift` count 0;
 iOS scheme BUILD SUCCEEDED; macOS scheme BUILD SUCCEEDED; `QuantizationTests` **5/5 passed**
 (`testBitExactRegression`, `testLowBitReconstruction`, plus the three shape-desc cases). The
 `tag-20260831` → `tag-20260918` range moved neither our fork's base nor upstream's requirement —
@@ -289,17 +324,19 @@ regression on the next merge.
 | 2026-08-31 | `tag-20260831` (`af35aee`) | `0.31.4` (`dc43e62` + `37b3ca1`) / `0.31.1` (`ce45c52`) | **No fork move — but upstream's requirement moved.** `mlx-swift-lm` PR #484 raised its pin to `.upToNextMinor(from: "0.31.6")`; the API it needed is #429, already cherry-picked onto `prism-1bit-0.31.4`. Audited every other `0.31.4→0.31.6` delta as Linux/CUDA plumbing, training-only optimizers or complex64 `finfo` — none reachable. PrismML patch untouched; gate re-run anyway: iOS + macOS BUILD SUCCEEDED, `QuantizationTests` 5/5. **Last two VLM fork patches retired** (Qwen3VL, GlmOcr) — upstream PR #475 gives each its own windowed `prepareContinuation`, so `MLXVLM/Models/` is byte-identical to upstream for the first time. 13 conflicts resolved; `Chat.Message.name` folded into upstream's typed `Tool.result(id:name:)`; declared-tool authorization moved to `ToolCallProcessor.allowedToolNames`; `pendingOutput` drain relocated into `processEOSOutputs()` so `TokenStreamDecoder.swift` is byte-identical. Three breaks with **no conflict marker**: `ToolTests.swift` duplicate `testGemma4FormatProcessor`, and the newly-`throws` `newCache`/`makePromptCache` family breaking `mlx-audio-swift/CSMModel.swift` **and** `AIChatModelMLX.applyPromptCacheReuse`. App side: PR #475's fail-closed continuation would have broken **every warm-cache VLM turn** — both predict paths now catch `ContinuationStateError` and rebuild at full prompt length |
 | 2026-09-18 | `tag-20260918` (`2e4417d`) | `0.31.4` (`dc43e62` + `37b3ca1`) / `0.31.1` (`ce45c52`) | **No version move — `Package.swift` byte-identical across the range; PrismML patch unaffected.** 17 upstream PRs. The cycle is dominated by #548 (bounded cross-dialect tool-call recovery), which rewrote the streaming tool-call layer all three fork-local tool patches attach to: a `TextToolCallRecoveryScanner` now runs **ahead of** the selected parser and re-splits chunks at dialect-signal boundaries, `scanTaggedStart` replaced the anchored `partialMatch` branch, `ToolCallPolicy` arrived on `GenerateParameters`, and `ToolArgumentNormalization` + `ToolSchemaValidator` gate every call at one admission boundary. Six conflicts resolved by threading `fallbackParser` and `toolCallPolicy` together rather than choosing; the `JSONToolCallParser` XMLFunction fallback had to move onto the framed content because upstream's rewritten `XMLFunctionParser` now demands a payload starting with `<function=`. **Five fork patches broke with no conflict marker** — `generateRecordingTokens` not forwarding `toolCallPolicy`; the recovery pass-through fast path bypassing `pendingOutput`; the legacy `processEOS` never draining it; the hold surviving a confirmed start tag (emitting pre-call text after the call); and the hold covering every `.normal` chunk, which only became visible once the scanner started pre-splitting. Also #620 (`clearCache()` moved onto the first generated token — looked like a re-introduction of the per-generation clear this app deleted in 2026-07-26, so it was **measured**: interleaved in-process A/B on `Qwen3.5-4B-MLX-4bit`, 256-token prompt / 48-token generation, `cacheLimit` pinned to 1 GB — upstream's cadence is **7-13% faster** across three readings, pool ~90 MB vs ~900 MB. The 2026-07-26 finding cleared *before* prefill at a 20 MB cacheLimit and does not transfer. **Do not fork-patch it.**), #611 (generation on a dedicated serial executor), #579 (async `loadWeights`), #515 (`PreparedInputSplitting`, `Qwen25VL` only — no shipped model conforms and the rule lives in `ChatSession`, which this app does not use), #584 (wrap-aware `RotatingKVCache.trim`), #613 (scalar-wise detokenizer prefix, fixes repeating ZWJ emoji), #615, #589, #471, #602, #596, #597, #591, #599, #605, #616. One break with **no conflict marker outside this repo**: #589's `CompileOverloads.swift` publishes `@Sendable`-bodied `compile` overloads that shadow `MLX.compile` in any file importing `MLXLMCommon`, breaking `mlx-audio-swift/ParakeetModel.swift` — both call sites qualified to `MLX.compile`. iOS + macOS BUILD SUCCEEDED; `QuantizationTests` 5/5; app suites `ToolCallParserTests` 84, `ToolCallParserChainTests` 23, `Gemma4ToolCallParserTests` 7, `MLXFinalStatsTests` 10, `MLXPromptCacheReuseTests` 33 — all green |
 | 2026-09-28 | `tag-20260928` (`2495a6f`) | `0.31.4` (`dc43e62` + `37b3ca1`) / `0.31.1` (`ce45c52`) | **No version move — PrismML patch unaffected.** One upstream PR, #603, entirely inside `MLXFoundationModels` (model-cache extraction, `evictAll()` cancels in-flight loads, per-model `MLXDownloadProgress`), which the app does not link; `MLXLMCommon` / `MLXLLM` / `MLXVLM` / `Package.swift` byte-identical, no conflicts. Post-merge MLX regression was identical to 2026-09-18. It had one real, pre-existing failure, and this cycle fixed it fork-locally: `LFM2.5-2.6B-4bit` (prod catalogue) never loaded. `LFM2Model.sanitize` now strips a `language_model.` prefix, and `LFM2Configuration` reads `intermediate_size` when `block_ff_dim` is absent. The second defect only appeared once the first was fixed. Also fixed the regression harness reusing a stale macOS host on a dirty tree. iOS + macOS BUILD SUCCEEDED; regression plain 14/0/2, tool-call 11/1/4, both `fixed: LFM2.5-2.6B-4bit` with no regressions; `QuantizationTests` not re-run (patch base untouched) |
+| 2026-10-17 | `tag-20261017` (`9d6b496`) | **`0.32.3` (`1960120`) / `v0.32.2` (`1f8e74e`)** | **Both axes moved — first core move since the fork was created.** 48 upstream PRs; upstream pinned mlx-swift `0.32.3` (#646, #657), which vendors mlx v0.32.2. `thirdparty/mlx` `prism-1bit-0.32.2`: PrismML's 3 commits cherry-picked onto `1f8e74e`, conflicts in `dequantize` (upstream float accumulation), the `dispatch_qmv` `qmv_quad` gate (`!global_scale` + `bits >= 2` at K=64 + `mode != "affine_sym"`) and a deleted CUDA test list, resolved against PrismML's own sync `4fc91df60`. **Trap found:** the bias-free `affine_sym` kernels existed only in mlx-swift's generated files and would have been deleted by `update-mlx.sh`; ported into the core (`7591f4029`). `thirdparty/mlx-swift` `prism-1bit-0.32.3` (`2a7e24b`) off the tag, shaders regenerated (only the 4 quantized files changed), new `testBiasFreeLowBitMatchesDerivedBias`. 7 merge conflicts (`Package.swift`, `Chat.swift`, `Evaluate.swift`, `Load.swift`, `TokenStreamDecoder.swift`, `Gemma4.swift`, `ToolTests.swift`). **Two fork patches broke with no conflict marker:** `fallbackParser` stranded when #640 moved `TextToolTokenLoopHandler` into `TokenLoopHandler.swift`, and `Gemma4FunctionParser` hiding #626's nested-argument parsing (now delegates native syntax to upstream). Bits guard moved ahead of #679's component-aware loading. Gate all green: `QuantizationTests` 11/11, iOS + macOS BUILD SUCCEEDED, regression generate 15/0/2 and tool-call 12/1/4 identical to the previous run, audio 19/19, FLUX.2 parity 55/55 with the golden slightly closer than before |
 
 ---
 
 ## How to upgrade (recurring, every 7-10 days)
 
 Use the **`mlx-swift-lm-upgrade`** skill (`helper/skills/mlx-swift-lm-upgrade/`). Triggers: "upgrade mlx-swift-lm",
-"merge mlx-swift-lm", "weekly MLX upgrade", a new `tag-YYYYMMDD`. It: merges upstream + resolves the recurring
-`MLXVLM/Models/*.swift` + `ChunkedPrefill.swift` conflicts, creates the dated `tag-<today>` branch, writes
+"merge mlx-swift-lm", "weekly MLX upgrade", a new `tag-YYYYMMDD`. It: merges upstream, resolves conflicts and audits for fork
+patches that upstream moved or shadowed without a conflict marker, creates the dated `tag-<today>` branch, writes
 `commit.log` + `whatsnew.md`, updates `LocalModelEngineInfo.mlxSwiftInfo`, adds a release note, and — the critical
 step 7 — re-reads `Package.swift` live, reconciles the `mlx-swift`/`mlx-core` versions, re-applies the PrismML patch
-onto the new base if the version moved, and re-runs the verification gate. **Append a row to the Upgrade history
+onto the new base if the version moved (checking the bias-free kernels before regenerating shaders), and re-runs
+the verification gate plus the LLM, audio and FLUX.2 regressions. **Append a row to the Upgrade history
 table above and refresh "Current state" each time.**
 
 Reference: `helper/docs/mlx-swift.md` → "Self-managed MLX forks" and "Checklist when merging upstream changes".
