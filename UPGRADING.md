@@ -1,7 +1,7 @@
 # MLX Stack — Versions & Upgrade Status
 
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
-starting from. Update this file on every upgrade (it is part of the `mlx-swift-lm-upgrade` skill's deliverables).
+starting from. Update this file on every upgrade (it is part of the `engine-upgrade` skill's `mlx` deliverables).
 
 **Last updated:** 2026-10-17
 
@@ -346,11 +346,11 @@ regression on the next merge.
 
 ## How to upgrade (recurring, every 7-10 days)
 
-Use the **`mlx-swift-lm-upgrade`** skill (`helper/skills/mlx-swift-lm-upgrade/`). Triggers: "upgrade mlx-swift-lm",
+Use the **`engine-upgrade`** skill (`helper/skills/engine-upgrade/`, `/engine-upgrade mlx`). Triggers: "upgrade mlx-swift-lm",
 "merge mlx-swift-lm", "weekly MLX upgrade", a new `tag-YYYYMMDD`. It: merges upstream, resolves conflicts and audits for fork
 patches that upstream moved or shadowed without a conflict marker, creates the dated `tag-<today>` branch, writes
 `commit.log` + `whatsnew.md`, updates `LocalModelEngineInfo.mlxSwiftInfo`, adds a release note, and — the critical
-step 7 — re-reads `Package.swift` live, reconciles the `mlx-swift`/`mlx-core` versions, re-applies the PrismML patch
+dependency step (P4) — re-reads `Package.swift` live, reconciles the `mlx-swift`/`mlx-core` versions, re-applies the PrismML patch
 onto the new base if the version moved (checking the bias-free kernels before regenerating shaders), and re-runs
 the verification gate plus the LLM, audio and FLUX.2 regressions. **Append a row to the Upgrade history
 table above and refresh "Current state" each time.**
