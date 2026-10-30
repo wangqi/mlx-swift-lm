@@ -199,13 +199,20 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     ///   (e.g. XML inside `<tool_call>` tags) is still recovered. Only the detokenized
     ///   decoder consults it; the framed token protocols (Harmony, Onyx) have no ambiguous
     ///   case to recover from, so `makeProtocolTokenStreamDecoder` does not take it.
-    ///   wangqi modified 2026-03-10 / re-threaded 2026-08-10 / 2026-08-31.
+    ///   wangqi modified 2026-03-10 / re-threaded 2026-08-10 / 2026-08-31 / 2026-10-30.
+    ///
+    /// - Parameter reasoning: the model's reasoning protocol and whether the
+    ///   rendered prompt already opened a thinking span. Only the detokenized
+    ///   decoder consumes it: a framed protocol decodes its own reasoning from
+    ///   the token stream, so passing this alongside one would scan the same
+    ///   text twice with two different rulebooks.
     package func makeTokenStreamDecoder(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
         stopStrings: Set<String>,
         fallbackParser: (any ToolCallParser)? = nil,
-        toolCallPolicy: ToolCallPolicy = .init()
+        toolCallPolicy: ToolCallPolicy = .init(),
+        reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
     ) -> any TokenStreamDecoder {
         if let decoder = makeProtocolTokenStreamDecoder(
             tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
@@ -215,7 +222,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         }
         return StandardTokenStreamDecoder(
             tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings,
-            fallbackParser: fallbackParser, toolCallPolicy: toolCallPolicy)
+            fallbackParser: fallbackParser, toolCallPolicy: toolCallPolicy,
+            reasoning: reasoning)
     }
 
     /// Builds a decoder only for formats which own a framed token protocol.
