@@ -212,11 +212,21 @@ only strategy such a cache can execute, and appending requires knowing exactly w
 Re-tokenizing the model's own text is not a substitute: it is not guaranteed to reproduce the ids it
 emitted, and a wrong ledger is silent corruption. See `helper/docs/mlx-swift.md` § 3a.
 
-**2026-10-30: it deliberately does not pass `reasoning:`** (commented in place). Upstream `generate()`
-now diverts thinking into `.reasoning` events (#563); the app reads only `event.chunk` and parses
-`<think>` and Gemma channels itself, so wiring one side without the other would make thinking text
-disappear. Wiring it end to end (here plus `AIChatModelMLX.consumeMLXStream`, with the `--tool-call`
-regression in the same change) is an open opportunity. Since this merge
+**2026-10-30: reasoning routing is opt-in through `reasoningPrompt: LMInput? = nil`** (last
+parameter, commented in place). Upstream `generate()` diverts thinking into `.reasoning` events (#563).
+Here `nil` keeps the stream byte-identical to the pre-#563 one (thinking stays in `.chunk`), so any other
+caller of the shared fork is unaffected. Non-nil seeds `TextToolTokenLoopHandler(reasoning:)` with the
+model's `reasoningConfig` and `primedInside`, computed on that prompt before the `TokenIterator` is built
+(reading it after would wait for the prefill). The caller passes the **full** rendered prompt, never the
+KV-reduced suffix it gives as `input`: a suffix can split the prefilled `<think>` and misread priming.
+The seed comes from the new **public** `recordingReasoningSeed(reasoningPrompt:modelConfiguration:tokenizer:)`,
+which the app (`AIChatModelMLX`, to keep its iteration text's primed shape) and
+`testcases/models/MLXCatalogueRegressionTests.swift` (`reasoning_required`) read too, so all three share
+one decision. Framed protocols (Harmony, Onyx) emit `.reasoning` whatever the parameter says. **On a
+merge:** if the parameter or the seeding is dropped, the app's thinking silently returns to `.chunk`
+(the bubble shows reasoning as the answer on primed prompts, thinking caps stop firing); no unit test in
+the app catches that, only the `run_model_tests.py --mlx-only --reasoning` regression run does. Keep
+`GenerationReasoningRoutingTests`' `recordingSeed*` tests green. Since the 2026-10-30 merge
 `testcases/models/MLXCatalogueRegressionTests.swift` probes through `generateRecordingTokens` too, so the
 regression gate judges the same text the app sees.
 

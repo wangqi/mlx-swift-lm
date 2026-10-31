@@ -2180,17 +2180,35 @@ public func generate(
 /// Await the returned task only after the stream has drained. Abandoning the stream leaves the
 /// iterator using the model, parameters and KV cache for a short while longer, and the task does
 /// not complete until it stops.
+///
+/// `reasoningPrompt` opts in to upstream's reasoning routing (#563). `nil` (the default) keeps
+/// the stream exactly as before: thinking stays inside `.chunk` text. Non-nil seeds the decoder
+/// with the model's ``ModelConfiguration/reasoningConfig`` and with whether that prompt ends
+/// inside an open reasoning block, so thinking arrives as `.reasoning` events. Pass the FULL
+/// rendered prompt, never the KV-reduced suffix given as `input`: a suffix can split the
+/// prefilled delimiter, and priming would then be misread. Framed protocols (Harmony, Onyx)
+/// emit `.reasoning` whatever this parameter says.
 // wangqi added 2026-08-24
+// reasoningPrompt: app opt-in to reasoning routing; nil = unchanged stream // wangqi modified 2026-10-30
 public func generateRecordingTokens(
     input: LMInput, cache: [KVCache]? = nil, state: LMOutput.State? = nil,
     parameters: GenerateParameters, context: ModelContext,
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil,
-    fallbackToolCallParser: (any ToolCallParser)? = nil
+    fallbackToolCallParser: (any ToolCallParser)? = nil,
+    reasoningPrompt: LMInput? = nil
 ) throws -> (AsyncStream<Generation>, Task<[Int], Never>) {
     MLXLogCollector.shared.log(
         "[Evaluate.generateRecordingTokens] enter promptTokens=\(input.text.tokens.size) hasCache=\(cache != nil)"
+    )
+    // Read the prompt before the iterator queues its prefill, which this would wait for, as the
+    // sibling generate(...) does. // wangqi modified 2026-10-30
+    let reasoning = recordingReasoningSeed(
+        reasoningPrompt: reasoningPrompt, modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer)
+    MLXLogCollector.shared.log(
+        "[Evaluate.generateRecordingTokens] reasoning=\(reasoning == nil ? "off" : "on") primedInside=\(reasoning?.primedInside ?? false)"
     )
     // state: kept in lockstep with the sibling generate(...) above, which gained it upstream so a
     // caller resuming a session can carry M-RoPE deltas across turns. wangqi modified 2026-08-31.
@@ -2214,12 +2232,12 @@ public func generateRecordingTokens(
             // wangqi modified 2026-09-18: this fork-added sibling of generate(...) must forward
             // the policy too, or cross-dialect recovery silently reverts to the default here
             // while the sibling honours the caller's GenerateParameters.
-            toolCallPolicy: parameters.toolCallPolicy
-            // wangqi modified 2026-10-30: deliberately NOT passing upstream's `reasoning:` (#563)
-            // here, unlike the sibling generate(...). The app (AIChatModelMLX) reads only
-            // `event.chunk` and parses <think> / Gemma 4 channels itself; wiring reasoning would
-            // turn thinking into `.reasoning` events it drops. Wire it together with the app's
-            // `.reasoning` handling (see the tag-20261030 upgrade handoff).
+            toolCallPolicy: parameters.toolCallPolicy,
+            // Upstream's `reasoning:` (#563), seeded only when the caller passed
+            // `reasoningPrompt` (nil = no routing, the pre-#563 stream). The app
+            // (AIChatModelMLX) opts in and routes the `.reasoning` events itself.
+            // wangqi modified 2026-10-30
+            reasoning: reasoning
         )
     )
 }
@@ -2467,6 +2485,24 @@ func promptPrimesReasoning(
         if let primed { return primed }
         count = min(tokens.size, count * 2)
     }
+}
+
+/// The reasoning seed `generateRecordingTokens` hands its decoder: the model's
+/// ``ModelConfiguration/reasoningConfig`` and whether `reasoningPrompt` ends inside an open
+/// reasoning block, or `nil` when no prompt is given or the model has no config.
+// App opt-in seed for generateRecordingTokens: nil prompt = no routing (byte-identical to the
+// pre-#563 stream). The caller passes the FULL rendered prompt, never a KV-reduced suffix,
+// which can split the prefilled delimiter. Public so callers can read `primedInside` from
+// the same decision the decoder is seeded with. // wangqi modified 2026-10-30
+public func recordingReasoningSeed(
+    reasoningPrompt: LMInput?, modelConfiguration: ModelConfiguration, tokenizer: Tokenizer
+) -> (config: ReasoningConfig, primedInside: Bool)? {
+    guard let reasoningPrompt, let config = modelConfiguration.reasoningConfig else { return nil }
+    return (
+        config,
+        promptPrimesReasoning(
+            input: reasoningPrompt, modelConfiguration: modelConfiguration, tokenizer: tokenizer)
+    )
 }
 
 /// Records the same token ledger with a composed output handler.

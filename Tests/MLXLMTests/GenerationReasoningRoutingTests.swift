@@ -200,6 +200,46 @@ struct GenerationReasoningRoutingTests {
         #expect(result.toolCalls.first?.function.name == "get_weather")
     }
 
+    // Tool markup inside a thought with no implicit exit, plus its positive control.
+    // wangqi modified 2026-10-30
+
+    /// Nemotron-H's config, spelled inline because this target does not import MLXLLM.
+    /// `FragmentTokenizer` has no special tokens, so this tests the text-scan path; switching
+    /// to `.thinkTagsWithEnableThinking` (`isSpecialToken: true`) would silently test the id path.
+    private var nemotronThinkTags: ReasoningConfig {
+        ReasoningConfig(
+            startDelimiter: "<think>", endDelimiter: "</think>",
+            promptStrategy: .templateFlag(key: "enable_thinking", defaultOn: true))
+    }
+
+    private let xmlFunctionCall =
+        "<tool_call>\n<function=get_date>\n<parameter=offset>\n10\n</parameter>\n</function>\n</tool_call>"
+
+    @Test("Tool markup inside a thought with no implicit exit is reasoning, not a call")
+    func toolMarkupInsideThoughtWithoutImplicitExitIsNotACall() {
+        let result = run(
+            ["plan ", xmlFunctionCall, "</think>", "Answer."],
+            format: .xmlFunction,
+            reasoning: (config: nemotronThinkTags, primedInside: true))
+
+        #expect(result.toolCalls.isEmpty)
+        #expect(result.responseText == "Answer.")
+        #expect(result.reasoningText.contains("<function=get_date>"))
+    }
+
+    /// Positive control for the test above: the same markup after `</think>` parses, so the
+    /// negative case cannot pass just because this harness never parses `.xmlFunction`.
+    /// Change both tests together, never one of them.
+    @Test("The same tool markup after the thought closes is a call")
+    func toolMarkupAfterThoughtWithoutImplicitExitIsACall() {
+        let result = run(
+            ["plan ", "</think>", xmlFunctionCall],
+            format: .xmlFunction,
+            reasoning: (config: nemotronThinkTags, primedInside: true))
+
+        #expect(result.toolCalls.map(\.function.name) == ["get_date"])
+    }
+
     // MARK: - Models with no reasoning protocol
 
     @Test("With no reasoning config the stream is unchanged")
@@ -303,6 +343,36 @@ struct GenerationReasoningRoutingTests {
             !promptPrimesReasoning(
                 input: input, modelConfiguration: ModelConfiguration(id: "test"),
                 tokenizer: tokenizer))
+    }
+
+    // MARK: - recordingReasoningSeed
+    // The public seed generateRecordingTokens hands its decoder; nil prompt = no routing.
+    // wangqi modified 2026-10-30
+
+    @Test("No reasoning prompt means no seed, even for a model with a reasoning config")
+    func recordingSeedIsNilWithoutAPrompt() {
+        let (_, tokenizer) = primedPrompt(tokenCount: 100, rank: 2)
+
+        #expect(
+            recordingReasoningSeed(
+                reasoningPrompt: nil, modelConfiguration: primedConfiguration,
+                tokenizer: tokenizer) == nil)
+    }
+
+    @Test("The seed reads priming from the prompt it is given")
+    func recordingSeedReadsThePromptItIsGiven() {
+        let (input, tokenizer) = primedPrompt(tokenCount: 100, rank: 2)
+
+        let seed = recordingReasoningSeed(
+            reasoningPrompt: input, modelConfiguration: primedConfiguration, tokenizer: tokenizer)
+        #expect(seed != nil)
+        #expect(seed?.primedInside == true)
+        #expect(seed?.config == .alwaysOnThinking)
+
+        #expect(
+            recordingReasoningSeed(
+                reasoningPrompt: input, modelConfiguration: ModelConfiguration(id: "test"),
+                tokenizer: tokenizer) == nil)
     }
 
     // MARK: - isInsideReasoning
