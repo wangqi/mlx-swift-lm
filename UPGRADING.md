@@ -3,7 +3,7 @@
 Records the current pinned state of the three self-managed MLX repos so a future upgrade knows exactly what it is
 starting from. Update this file on every upgrade (it is part of the `thirdparty-upgrade` skill's `mlx` deliverables).
 
-**Last updated:** 2026-10-30
+**Last updated:** 2026-11-13
 
 > These three are **independent local git repos** under `thirdparty/` (not app submodules). The app
 > (`AIAssistant.xcodeproj`) wires them as local SwiftPM packages; a root-level `XCLocalSwiftPackageReference` for
@@ -16,7 +16,7 @@ starting from. Update this file on every upgrade (it is part of the `thirdparty-
 
 | Repo | Remote (origin) | Branch | HEAD | Role |
 |------|-----------------|--------|------|------|
-| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `main` (= `tag-20261030`) | `297795a` (merge `0c150ad` + docs) | LLM/VLM layer (the package upgraded every 7-10 days) |
+| `thirdparty/mlx-swift-lm` | `wangqi/mlx-swift-lm` | `main` (= `tag-20261113`) | see the 2026-11-13 history row (merge `c041e0e` + docs) | LLM/VLM layer (the package upgraded every 7-10 days) |
 | `thirdparty/mlx-swift`    | `wangqi/mlx-swift` (+ `upstream` = `ml-explore/mlx-swift`) | `main` (= `prism-1bit-0.33.0`) | `02a4a944` | Swift API + vendored mlx-core; carries the PrismML patch |
 | `thirdparty/mlx`          | `wangqi/mlx` (+ `prism` = `PrismML-Eng/mlx`, `upstream` = `ml-explore/mlx`) | `main` (= `prism-1bit-0.32.4`) | `743ae9056` | mlx-core C++ fork; holds the PrismML bias-free (`affine_sym`) patch |
 
@@ -27,7 +27,7 @@ previous branches (`prism-1bit-0.32.3` @ `2a7e24b`, `prism-1bit-0.32.2` @ `7591f
 `37b3ca1`, `prism-1bit-0.31.1` @ `48db7fe5`) are kept for rollback.
 
 ### Engine version surfaced in the app
-- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20261030"` (`views/settings/models/LocalModelAboutView.swift`).
+- `LocalModelEngineInfo.mlxSwiftInfo.version` = `"20261113"` (`views/settings/models/LocalModelAboutView.swift`).
 
 ---
 
@@ -392,6 +392,7 @@ regression on the next merge.
 | 2026-10-17 | `tag-20261017` (`9d6b496`) | **`0.32.3` (`1960120`) / `v0.32.2` (`1f8e74e`)** | **Both axes moved — first core move since the fork was created.** 48 upstream PRs; upstream pinned mlx-swift `0.32.3` (#646, #657), which vendors mlx v0.32.2. `thirdparty/mlx` `prism-1bit-0.32.2`: PrismML's 3 commits cherry-picked onto `1f8e74e`, conflicts in `dequantize` (upstream float accumulation), the `dispatch_qmv` `qmv_quad` gate (`!global_scale` + `bits >= 2` at K=64 + `mode != "affine_sym"`) and a deleted CUDA test list, resolved against PrismML's own sync `4fc91df60`. **Trap found:** the bias-free `affine_sym` kernels existed only in mlx-swift's generated files and would have been deleted by `update-mlx.sh`; ported into the core (`7591f4029`). `thirdparty/mlx-swift` `prism-1bit-0.32.3` (`2a7e24b`) off the tag, shaders regenerated (only the 4 quantized files changed), new `testBiasFreeLowBitMatchesDerivedBias`. 7 merge conflicts (`Package.swift`, `Chat.swift`, `Evaluate.swift`, `Load.swift`, `TokenStreamDecoder.swift`, `Gemma4.swift`, `ToolTests.swift`). **Two fork patches broke with no conflict marker:** `fallbackParser` stranded when #640 moved `TextToolTokenLoopHandler` into `TokenLoopHandler.swift`, and `Gemma4FunctionParser` hiding #626's nested-argument parsing (now delegates native syntax to upstream). Bits guard moved ahead of #679's component-aware loading. Gate all green: `QuantizationTests` 11/11, iOS + macOS BUILD SUCCEEDED, regression generate 15/0/2 and tool-call 12/1/4 identical to the previous run, audio 19/19, FLUX.2 parity 55/55 with the golden slightly closer than before |
 | 2026-10-24 | `tag-20261024` (`2aa485b`) | `0.32.3` (`1960120`) / `v0.32.2` (`1f8e74e`) | No version move — PrismML patch unaffected. 8 upstream commits, merged with no conflicts; `fallbackParser` intact. #710 clears the MLX buffer cache after each `forEachChunk` prefill chunk (lower peak memory on long prompts); Qwen3VL keeps M-RoPE positions correct after context rotation. Fork `ChunkedPrefill.swift` kept (no production caller; `MLXVLMLongPromptTests` still uses it). Gate: `swift build` + 119 tests, iOS + macOS BUILD SUCCEEDED, 5 MLX app suites green, regression generate 17/0/0 and tool-call 15/0/2 identical to the pre-merge baseline |
 | 2026-10-30 | `tag-20261030` (`297795a`; merge `0c150ad`) | **`0.33.0` (`7ede4fd6`) / `v0.32.4` (`36969c094`)** | **Both axes moved, forced by #720** (`.upToNextMinor(from: "0.33.0")`; `CompileOverloads.swift` deleted upstream, #746 needs `Memory.bufferSize`). 15 upstream PRs (#563, #703, #712, #720, #723, #728, #730, #731, #732, #735, #736, #737, #740, #745, #746). **PrismML patch shrank to bias-free only:** upstream mlx #3161 absorbed PrismML commits 1-2, so `prism-1bit-0.32.4` carries `5c30ce419`, `1c0bb0310` and `743ae9056`; the `affine_sym` kernels re-based onto #4516's `partial_rows` (7 template args), and the `qmv_wide` routing gap (bias-free `2 <= M < vector_limit` → missing kernel, open since `prism-1bit-0.32.2`) closed. `prism-1bit-0.33.0` (`02a4a944`) regenerates only 2 shader files. 5 merge conflicts, all in the `fallbackParser` chain, resolved by threading `fallbackParser` ahead of upstream's new `reasoning:`. **Decision:** #563's `.reasoning` events are not wired into `generateRecordingTokens`; the app still sees thinking in `.chunk`. #740 runs Qwen3.5 gated delta on `MLXFast.gatedDeltaUpdate` when shapes allow. `MLXCatalogueRegressionTests` probes switched to `generateRecordingTokens`. New catalogue row `NVIDIA-Nemotron-3-Nano-4B-4bit` (`nemotron_h`, parser id `qwen35`, xmlFunction). Gate: `QuantizationTests` 11/11, `swift build` + 119 tests, regression generate 24/0/0 and tool-call 16/0/2 with no regressions vs 20261025, FLUX.2 parity 34/34 |
+| 2026-11-13 | `tag-20261113` (merge `c041e0e`) | `0.33.0` (`7ede4fd6`) / `v0.32.4` (`36969c094`) | No version move — PrismML patch unaffected. 25 upstream PRs (LFM3 #750, LFM2.5 #528, MiniCPM5 tool parser #637, MTP speculative decoding #581/#724/#774, mid-turn steering #608, VLM float32 fix #766). Fork: LFM2 patches absorbed by #528, own MiniCPM5 parser replaced by upstream's plus an end-of-stream flush fix, `generateRecordingTokens` keeps its token-id return over #581's recorder. Gate: generate 27/0/0, tool-call 19/0/2 of 21, reasoning 21/0/0, no REGRESSED; both app schemes build. |
 
 ---
 

@@ -200,9 +200,9 @@ LFM Open License v1.0 allows redistribution with attribution, and the existing L
 
 | Model (HF repo) | Size | License | Decision | Reason |
 |---|---|---|---|---|
-| `LiquidAI/LFM3-1.7B-MLX-4bit` (`lfm3`) | 0.99 GB | LFM 1.0 | **Add** | A new family supported this merge, and the GGUF twin is already a row. Tools via `.xmlFunction` (`<tool_call><function=…>`), always-on `<think>`. Copy the GGUF row's sampling (temp 0.1, top_k 50, rep 1.1); `toolcall_parser_id` stays empty, as on the LFM2.5 MLX rows. Run `MLXCatalogueRegressionTests` before shipping. |
-| `mlx-community/MiniCPM5-2B-mlx-4Bit` (`llama`) | 1.43 GB | Apache-2.0 | **Add** | The GGUF and Core AI 2B rows exist, and the template uses the same `<function name=` tool format, so `toolcall_parser_id: "minicpm5"`. The `-chat-mlx-4bit` repo is the same base and size, with fewer downloads. |
-| `LiquidAI/LFM2.5-1.2B-Thinking-MLX-4bit` (`lfm2`) | 0.66 GB | LFM 1.0 | Decision | A small reasoning model, but LFM3-1.7B (always thinking, newer) covers the same slot. Add only if a sub-1 GB thinking row is wanted. |
+| `LiquidAI/LFM3-1.7B-MLX-4bit` (`lfm3`) | 0.99 GB | LFM 1.0 | **Added** | A new family supported this merge, and the GGUF twin is already a row. Tools via `.xmlFunction` (`<tool_call><function=…>`), always-on `<think>`. Copy the GGUF row's sampling (temp 0.1, top_k 50, rep 1.1); `toolcall_parser_id` stays empty, as on the LFM2.5 MLX rows. Run `MLXCatalogueRegressionTests` before shipping. |
+| `mlx-community/MiniCPM5-2B-mlx-4Bit` (`llama`) | 1.43 GB | Apache-2.0 | **Added** | The GGUF and Core AI 2B rows exist, and the template uses the same `<function name=` tool format, so `toolcall_parser_id: "minicpm5"`. The `-chat-mlx-4bit` repo is the same base and size, with fewer downloads. |
+| `LiquidAI/LFM2.5-1.2B-Thinking-MLX-4bit` (`lfm2`) | 0.66 GB | LFM 1.0 | **Added** | Eligible (under 4B, no new code), so added under the catalogue rule; passed generate, tool-call (`lfm2`) and reasoning. |
 | `LiquidAI/LFM2.5-VL-450M-MLX-4bit` (`lfm2-vl`) | 0.38 GB | LFM 1.0 | Reject | The GGUF row `LFM2.5-VL-450M-Q8_0` already covers it, and VL-1.6B is the MLX vision entry. |
 | `LiquidAI/LFM2.5-350M-MLX-4bit`, `-230M-MLX-4bit` | 0.23 / 0.15 GB | LFM 1.0 | Reject | Too weak for general chat. |
 | `LiquidAI/LFM3-VL-2B-MLX-4bit` (`lfm3_vl`) | 1.61 GB | LFM 1.0 | Reject | `lfm3_vl` is not registered in MLXVLM (#750 is text only). Revisit when upstream adds the wrapper. |
@@ -210,6 +210,17 @@ LFM Open License v1.0 allows redistribution with attribution, and the existing L
 | `mlx-community/embeddinggemma-2-4bit` | 1.13 GB | Apache-2.0 | Decision | This is not a chat row. It would serve semantic search (Opportunities), but it bundles the vision and audio encoders, so a text-only conversion would be far smaller. |
 
 ---
+
+## Verification
+
+- Quick gate: `swift build` OK; `ToolTests|TokenStreamDecoder|ChatTests|MiniCPM5|ToolCallFormatInference|LFM2Tests` 151 passed.
+- P10 sweeps (macOS test host, slot 9) vs the 10-31 baselines at `0a5ff28`:
+  generate **27 passed / 0 failed / 0 skipped** (`20261113-154946`, baseline 24/0/0);
+  tool-call **19 / 0 / 2 of 21** (`20261113-155903`, baseline 16/0/2 of 18), every row in its intended `tool_call_format`, 0 recovered calls;
+  reasoning **21 / 0 / 0** (`20261113-161053`, baseline 18/0/0). No REGRESSED. New rows: LFM3-1.7B-MLX-4bit, MiniCPM5-2B-mlx-4Bit, LFM2.5-1.2B-Thinking-MLX-4bit.
+- Standing WARN (also in the 2026-10-30 run): `Ministral-3-3B-Instruct-2512-4bit` and `gemma-4-e2b-it-4bit` are catalogued `image2text` but load through the LLM factory, so MLX sends them no image.
+- Unit suites (iOS sim): MLXFinalStats, MLXKVCacheEstimate, MLXMemoryBudget, MLXPromptCacheReuse, MLXAssistantReplay, MLXReasoningStream, ToolCallParser, AppToolCallParserBridge, CoreAIToolCallFallback all pass; MLXBrokenQuantConfigTests runs on the macOS host.
+- Not verified: the LFM2 rewindable-cache prompt reuse in a live multi-turn chat (R-medium).
 
 ## Opportunities (not built)
 
