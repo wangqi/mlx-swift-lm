@@ -5,7 +5,8 @@ import Testing
 
 @testable import MLXLMCommon
 
-// wangqi modified 2026-10-18
+// Retargeted at upstream's MiniCPM5ToolCallParser (35bd2c9), which replaced the fork parser;
+// these keep the recorded MiniCPM5-1B output as a regression probe. wangqi modified 2026-11-13
 struct MiniCPM5FunctionParserTests {
 
     private static let tools: [[String: any Sendable]] = [
@@ -39,12 +40,12 @@ struct MiniCPM5FunctionParserTests {
 
         #expect(
             ToolCallFormat.resolved(forTokenizerDirectory: directory, modelFormat: .llama3)
-                == .minicpm5)
+                == .miniCPM5)
     }
 
     @Test("Streamed in small chunks, the recorded output yields one call and no raw syntax")
     func streamedRecordedOutputYieldsOneCall() throws {
-        let processor = ToolCallProcessor(format: .minicpm5, tools: Self.tools)
+        let processor = ToolCallProcessor(format: .miniCPM5, tools: Self.tools)
         var text = ""
         var index = Self.recorded.startIndex
         while index < Self.recorded.endIndex {
@@ -68,7 +69,7 @@ struct MiniCPM5FunctionParserTests {
     @Test("A CDATA value is unwrapped and multi-line text is kept")
     func cdataValueIsUnwrapped() throws {
         let call = try #require(
-            MiniCPM5FunctionParser().parse(
+            MiniCPM5ToolCallParser().parse(
                 content:
                     "<function name=\"write_note\"><param name=\"body\"><![CDATA[line one\nline two]]></param></function>",
                 tools: nil))
@@ -78,7 +79,7 @@ struct MiniCPM5FunctionParserTests {
 
     @Test("Content split on the start tag still parses")
     func contentWithoutStartTagParses() throws {
-        let calls = MiniCPM5FunctionParser().parseEOS(
+        let calls = MiniCPM5ToolCallParser().parseEOS(
             "<function name=\"get_date\"><param name=\"offset\">3</param></function>",
             tools: Self.tools)
         #expect(calls.count == 1)
@@ -88,7 +89,7 @@ struct MiniCPM5FunctionParserTests {
     @Test("A call without a name is rejected")
     func missingNameIsRejected() {
         #expect(
-            MiniCPM5FunctionParser().parse(
+            MiniCPM5ToolCallParser().parse(
                 content: "<function name=\"\"><param name=\"offset\">1</param></function>",
                 tools: nil) == nil)
     }

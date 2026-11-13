@@ -48,12 +48,12 @@ import MLXGuidedGeneration
 ///         }
 ///         return cache.repoDirectory(repo: repo, kind: .model)
 ///     },
-///     load: { configuration, progressHandler in
+///     load: { configuration, progress in
 ///         try await loadModelContainer(
 ///             from: #hubDownloader(),
 ///             using: #huggingFaceTokenizerLoader(),
 ///             configuration: configuration,
-///             progressHandler: progressHandler)
+///             progress: progress)
 ///     })
 /// let session = LanguageModelSession(model: model, tools: [], instructions: nil)
 /// let response = try await session.respond(to: "Hello!")
@@ -90,13 +90,24 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// This closure must honor cancellation while it is suspended. ``evict()``
     /// and ``evictAll()`` cancel the load task tied to this closure. A closure
     /// that ignores cancellation keeps running and keeps its caller waiting.
+    @available(
+        *, deprecated, message: "Use ProgressContainerLoader with the progress-aware initializer"
+    )
     public typealias ContainerLoader =
         @Sendable (
             _ configuration: ModelConfiguration,
             _ progressHandler: @Sendable @escaping (Progress) -> Void
         ) async throws -> ModelContainer
 
-    private let load: ContainerLoader
+    /// A container loader that receives phase-specific download and weight progress.
+    public typealias ProgressContainerLoader =
+        @Sendable (
+            _ configuration: ModelConfiguration,
+            _ progress: LoadProgressHandlers
+        ) async throws -> ModelContainer
+
+    private let load: ProgressContainerLoader
+    private let progress: LoadProgressHandlers
 
     /// Stable identity for the model cache, executor configuration, tokenizer
     /// caches, availability, and progress reporting. Derived from the
@@ -134,6 +145,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     private func makeContainerLoader() -> @Sendable () async throws -> ModelContainer {
         let configuration = self.configuration
         let load = self.load
+        let configuredProgress = self.progress
         return {
             // Configure the buffer pool once per process rather than on every
             // load, so a consumer's own `Memory.cacheLimit` survives our loads.
@@ -145,10 +157,14 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let loadID = UUID()
             MLXDownloadProgress.reportStarted(modelID: configuration.name, loadID: loadID)
             defer { MLXDownloadProgress.reportEnded(modelID: configuration.name, loadID: loadID) }
-            return try await load(configuration) { progress in
-                MLXDownloadProgress.report(
-                    progress: progress, modelID: configuration.name, loadID: loadID)
-            }
+            let progress = LoadProgressHandlers(
+                download: { progress in
+                    MLXDownloadProgress.report(
+                        progress: progress, modelID: configuration.name, loadID: loadID)
+                    configuredProgress.download?(progress)
+                },
+                weights: configuredProgress.weights)
+            return try await load(configuration, progress)
         }
     }
 
@@ -251,10 +267,11 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// `.allowed` tool routing, guided `.required` developer tool calls,
     /// and reasoning (chain-of-thought) routing.
     ///
-    /// Capabilities are declared explicitly by the caller at ``init(configuration:capabilities:configurationResolver:prefillStepSize:weightsLocation:load:)``
+    /// Capabilities are declared explicitly by the caller at
+    /// ``init(configuration:capabilities:configurationResolver:prefillStepSize:weightsLocation:progress:load:)``
     /// and stored verbatim. The caller includes
     /// `.guidedGeneration`/`.toolCalling`/`.reasoning` as appropriate; the
-    /// adapter does not consult ``ReasoningHeuristics`` (which remains a
+    /// adapter does not consult `ReasoningHeuristics` (which remains a
     /// standalone helper a caller may use to compute their own capability set).
     ///
     /// Declaring `.reasoning` matters for request routing: the framework only
@@ -264,7 +281,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// capability was declared.
     public let capabilities: LanguageModelCapabilities
 
-    /// The configuration resolver that patches a per-call ``ModelConfiguration``
+    /// The configuration resolver that patches a per-call `ModelConfiguration`
     /// for this instance. Defaults to ``DefaultConfigurationResolver`` when
     /// omitted.
     public let configurationResolver: any ModelConfigurationResolver
@@ -288,7 +305,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///   - capabilities: The capabilities this model supports
     ///     (`.guidedGeneration`, `.toolCalling`, `.reasoning`, `.vision`).
     ///     Stored verbatim; the adapter never infers or expands the set.
-    ///   - configurationResolver: Patches a per-call ``ModelConfiguration``
+    ///   - configurationResolver: Patches a per-call `ModelConfiguration`
     ///     (reasoning config, extra stop tokens) for this instance.
     ///   - prefillStepSize: Prompt prefill step size. `nil` uses the default step size.
     ///   - weightsLocation: Resolves a model identifier to its on-disk weights
@@ -302,6 +319,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///     URL(fileURLWithPath: "/Volumes/SharedCache/models/\(id)")
     /// }
     /// ```
+    @_disfavoredOverload
+    @available(*, deprecated, message: "Use init(..., progress:load:)")
     public init(
         configuration: ModelConfiguration,
         capabilities: [LanguageModelCapabilities.Capability] = [.guidedGeneration],
@@ -316,7 +335,35 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         self.configurationResolver = configurationResolver
         self.prefillStepSize = prefillStepSize
         self.weightsLocation = weightsLocation
+        self.load = { configuration, progress in
+            try await load(configuration, progress.download ?? { _ in })
+        }
+        self.progress = .init()
+    }
+
+    /// Creates an `MLXLanguageModel` whose loader receives phase-specific model
+    /// loading progress.
+    ///
+    /// Use this initializer when the loader forwards `LoadProgressHandlers` to
+    /// `loadModelContainer`. The deprecated `load:` initializer remains available
+    /// for source compatibility with download-only loaders.
+    public init(
+        configuration: ModelConfiguration,
+        capabilities: [LanguageModelCapabilities.Capability] = [.guidedGeneration],
+        configurationResolver: any ModelConfigurationResolver =
+            DefaultConfigurationResolver(),
+        prefillStepSize: Int? = nil,
+        weightsLocation: @Sendable @escaping (String) -> URL,
+        progress: LoadProgressHandlers = .init(),
+        load: @escaping ProgressContainerLoader
+    ) {
+        self.configuration = configuration
+        self.capabilities = LanguageModelCapabilities(capabilities)
+        self.configurationResolver = configurationResolver
+        self.prefillStepSize = prefillStepSize
+        self.weightsLocation = weightsLocation
         self.load = load
+        self.progress = progress
     }
 
     /// Downloads the model and loads its weights into memory.
@@ -669,12 +716,11 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             if collected.isEmpty {
                 collected = [Chat.Message.user("")]
             }
-            let messages = collected
 
             // The SDK's vision check does not cover `.attachment` segments, so the adapter
             // must enforce `.vision` for image attachments itself.
             if !model.capabilities.contains(.vision),
-                messages.contains(where: { !$0.images.isEmpty })
+                collected.contains(where: { !$0.images.isEmpty })
             {
                 throw LanguageModelError.unsupportedCapability(
                     LanguageModelError.UnsupportedCapability(
@@ -699,6 +745,14 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             } else {
                 schemaJSON = nil
             }
+
+            // Guided generation adds the schema, including its @Guide descriptions,
+            // to the system prompt, so the model sees more than the grammar.
+            // `includeSchemaInPrompt` refers to the system prompt. Tool-aware
+            // prompts are unchanged.
+            let promptMessages = TranscriptConverter.promptMessages(
+                collected, schemaJSON: schemaJSON,
+                includeSchemaInPrompt: request.contextOptions.includeSchemaInPrompt)
 
             let modelID = self.modelID
             let requestedMaxTokens = request.generationOptions.maximumResponseTokens
@@ -729,16 +783,17 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     ["modelID": modelID, "requestID": request.id.uuidString],
                     entryID: entryID, into: channel)
 
-                // Generate tokens inside actor isolation. `messages` carries
+                // Generate tokens inside actor isolation. `promptMessages` carries
                 // non-Sendable `Chat.Message` instances (UserInput.Image and
-                // .Video are not Sendable), so route the array through
+                // .Video are not Sendable), so route it through
                 // perform(nonSendable:_:) which boxes it across the actor hop.
-                try await container.perform(nonSendable: messages) { context, messages in
+                try await container.perform(nonSendable: promptMessages) {
+                    context, promptMessages in
                     try AttachmentLabelValidator.default.validate(
                         labeledAttachments, with: context.tokenizer)
 
-                    // Render the prompt through the model's UserInputProcessor.
-                    let userInput = UserInput(chat: messages)
+                    // Render the guided-generation prompt through the model's UserInputProcessor.
+                    let userInput = UserInput(chat: promptMessages.withSchema)
                     let input = try await context.processor.prepare(input: userInput)
 
                     // Resolve the per-instance configuration. Held strictly as
@@ -816,7 +871,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         let suppressionConfig = resolved.reasoningConfig
                     {
                         suppressedInput = try await Self.preparedInput(
-                            messages: messages, config: suppressionConfig,
+                            messages: promptMessages.withoutSchema, config: suppressionConfig,
                             thinkingEnabled: false, processor: context.processor,
                             cannotDisableMessage:
                                 "This model always reasons; .reasoning must be declared at MLXLanguageModel init to receive its output."
@@ -833,7 +888,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         let thinkingEnabled = Self.thinkingEnabled(
                             for: request.contextOptions.reasoningLevel)
                         let reasoningInput = try await Self.preparedInput(
-                            messages: messages, config: reasoningConfig,
+                            messages: promptMessages.withoutSchema, config: reasoningConfig,
                             thinkingEnabled: thinkingEnabled, processor: context.processor,
                             cannotDisableMessage:
                                 "This model always reasons; reasoning cannot be disabled via reasoningLevel."
@@ -941,7 +996,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 from: enabledToolDefinitions)
                             let toolAwareInput = try await context.processor.prepare(
                                 input: UserInput(
-                                    chat: messages,
+                                    chat: promptMessages.withoutSchema,
                                     tools: toolSpecs,
                                     additionalContext: toolAwareContext))
                             let reasoning = routedReasoningConfig.map {
@@ -1015,7 +1070,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             from: requiredToolDefinitions)
                         let toolAwareInput = try await context.processor.prepare(
                             input: UserInput(
-                                chat: messages,
+                                chat: promptMessages.withoutSchema,
                                 tools: toolSpecs,
                                 additionalContext: toolAwareContext))
 
@@ -1569,6 +1624,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     break
                 case .rejectedToolCall(let rejection):
                     throw RejectedToolCallError(rejection)
+                case .steering:
+                    break
                 }
             }
         }

@@ -211,7 +211,7 @@ public struct GenerateParameters: Sendable {
     /// Per-token log-probability reporting. `nil` disables reporting; `0` reports
     /// the selected token only, and a positive value also reports that many top tokens.
     /// Use ``LogProbabilityTokenLoopHandler`` to emit these values through a custom generation loop.
-    /// Only ``TokenIterator`` reports them; speculative iterators ignore this setting.
+    /// Speculative iterators report the verifier's values for each emitted token.
     public var logProbabilities: Int?
 
     /// Optional seed for reproducible sampling. When set, the sampler's RNG
@@ -844,6 +844,46 @@ public struct DeferredTokenLogProbabilities {
             .asType(.float32)
     }
 
+    private init(
+        token: MLXArray, chosenLogProbability: MLXArray,
+        topTokenIDs: MLXArray?, topLogProbabilities: MLXArray?
+    ) {
+        self.token = token
+        self.chosenLogProbability = chosenLogProbability
+        self.topTokenIDs = topTokenIDs
+        self.topLogProbabilities = topLogProbabilities
+    }
+
+    /// Records the log probabilities of tokens sampled from the rows of processed logits.
+    ///
+    /// One batch serves every row and evaluates in the background, so a speculative round
+    /// pays one normalization for the tokens it emits, outside its accept loop.
+    ///
+    /// - Parameters:
+    ///   - tokens: The sampled tokens, in emission order, one or more per array.
+    ///   - logits: The processed logits each token was sampled from, one row per token.
+    ///   - topK: The candidates to report per token; `nil` records nothing.
+    /// - Returns: One value per token, or none when `topK` is `nil`.
+    static func recording(
+        _ tokens: [MLXArray], sampledFrom logits: [MLXArray], topK: Int?
+    ) -> [DeferredTokenLogProbabilities] {
+        guard let topK, !tokens.isEmpty else { return [] }
+        let tokens = concatenated(tokens.map { $0.flattened() })
+        let batch = LogProbabilityDistribution(
+            logits: concatenated(logits.map { $0.reshaped(-1, $0.dim(-1)) })
+        ).recording(token: tokens, topK: topK)
+        let rows = (0 ..< tokens.dim(0)).map { row in
+            DeferredTokenLogProbabilities(
+                token: batch.token[row ..< row + 1],
+                chosenLogProbability: batch.chosenLogProbability[row ..< row + 1],
+                topTokenIDs: batch.topTokenIDs?[row ..< row + 1],
+                topLogProbabilities: batch.topLogProbabilities?[row ..< row + 1])
+        }
+        // Evaluate the row views too: each unevaluated view read later is a GPU sync.
+        asyncEval(rows.flatMap { [$0.token] + $0.arrays })
+        return rows
+    }
+
     var arrays: [MLXArray] {
         [chosenLogProbability, topTokenIDs, topLogProbabilities].compactMap { $0 }
     }
@@ -900,8 +940,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Per-call model state (e.g. M-RoPE rope deltas), seeded from the
     /// initializer's `state`, replaced by prefill, then threaded through
     /// every decode step. A caller continuing this cache later (as
-    /// ``ChatSession`` does across turns) reads it back after
-    /// initialization and seeds the next iterator with it.
+    /// ``ChatSession`` does across turns) reads it back after generation
+    /// and seeds the next iterator with it.
     public internal(set) var state: LMOutput.State?
 
     var y: LMInput.Text
@@ -1263,6 +1303,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let logProbabilityTopK: Int?
+
+    /// Log probabilities for the token returned by the most recent ``next()`` call.
+    public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
@@ -1270,6 +1314,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     // Buffer of accepted tokens from the current speculation round
     private var pendingTokens = [Int]()
+    /// The verifier's log probabilities for `pendingTokens`, when requested.
+    private var pendingLogProbabilities = [DeferredTokenLogProbabilities]()
     private var pendingIndex = 0
     /// Pending tokens already represented by each cache. The final token in a
     /// speculative round is sampled from the verifier logits but is not fed
@@ -1391,6 +1437,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.state = mainState
 
         self.sampler = parameters.sampler()
+        self.logProbabilityTopK = parameters.logProbabilities.map { Swift.max($0, 0) }
         try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
 
@@ -1435,6 +1482,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             // prefill-sampled token must be queued here or the stream would
             // silently start at the second generated token.
             pendingTokens.append(token.item(Int.self))
+            recordLogProbabilities(of: [token], sampledFrom: [logits])
         }
 
         // Prefill draft model, don't call didSample here -- processor tracks main model's accepted sequence only
@@ -1529,20 +1577,24 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         state = mainResult.state
 
         let mainTokens: MLXArray
+        let verifyLogits: MLXArray
         if var verifyProcessor = processor?.copy() {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
+            var processed = [MLXArray]()
             for i in 0 ..< (numDraft + 1) {
                 var logits = mainLogits[0..., verifyStart + i, 0...]
                 logits = verifyProcessor.process(logits: logits)
                 let token = sampler.sample(logits: logits)
                 verifyProcessor.didSample(token: token)
                 sampled.append(token)
+                processed.append(logits)
             }
             mainTokens = concatenated(sampled)
+            verifyLogits = concatenated(processed)
         } else {
             // Batch-sample all verify tokens from main model in one operation
-            let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
+            verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
             mainTokens = sampler.sample(logits: verifyLogits)
         }
 
@@ -1566,6 +1618,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         let finalToken = mainTokens[accepted ... accepted]
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
+        recordLogProbabilities(
+            of: [mainTokens[0 ... accepted]], sampledFrom: [verifyLogits[0 ... accepted]])
         mainCommittedPendingTokenCount = accepted
         // When every draft is accepted the draft cache still trails the main
         // cache by one accepted token; `draftY` carries that token into the
@@ -1629,10 +1683,29 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         processor?.didSample(token: token)
         eval(token)
         pendingTokens.append(token.item(Int.self))
+        recordLogProbabilities(of: [token], sampledFrom: [logits])
         mainCommittedPendingTokenCount = 0
         draftCommittedPendingTokenCount = 0
         y = .init(tokens: token)
         kvCachePlan.apply(to: mainCacheStorage)
+    }
+
+    /// Records the verifier's log probabilities for tokens just queued in `pendingTokens`.
+    private mutating func recordLogProbabilities(
+        of tokens: [MLXArray], sampledFrom logits: [MLXArray]
+    ) {
+        pendingLogProbabilities += DeferredTokenLogProbabilities.recording(
+            tokens, sampledFrom: logits, topK: logProbabilityTopK)
+    }
+
+    /// Returns the next queued token and makes its log probabilities current.
+    private mutating func dequeuePendingToken() -> Int {
+        lastLogProbabilities =
+            logProbabilityTopK == nil ? nil : pendingLogProbabilities[pendingIndex]
+        let token = pendingTokens[pendingIndex]
+        pendingIndex += 1
+        telemetry.recordGeneratedToken()
+        return token
     }
 
     mutating public func next() -> Int? {
@@ -1642,16 +1715,14 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Drain the pending buffer first
         if pendingIndex < pendingTokens.count {
-            let token = pendingTokens[pendingIndex]
-            pendingIndex += 1
-            telemetry.recordGeneratedToken()
-            return token
+            return dequeuePendingToken()
         }
 
         // Run a new speculation round. Pooled: a round runs draft + verify
         // forwards whose autoreleased MLX temporaries otherwise accumulate
         // across the whole generation.
         pendingTokens.removeAll(keepingCapacity: true)
+        pendingLogProbabilities.removeAll(keepingCapacity: true)
         pendingIndex = 0
         mainCommittedPendingTokenCount = 0
         draftCommittedPendingTokenCount = 0
@@ -1661,10 +1732,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             return nil
         }
 
-        let token = pendingTokens[pendingIndex]
-        pendingIndex += 1
-        telemetry.recordGeneratedToken()
-        return token
+        return dequeuePendingToken()
     }
 
 }
@@ -2127,6 +2195,8 @@ public func generate(
 ///         print("Tool call: \(call.function.name)")
 ///     case .rejectedToolCall(let rejection):
 ///         print("Rejected tool call: \(rejection.reason)")
+///     case .steering:
+///         break
 ///     }
 /// }
 /// ```
@@ -2222,7 +2292,10 @@ public func generateRecordingTokens(
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
-        tokenCollector: RecordingGeneratedTokens(),
+        // Upstream's RecordingGeneratedTokens now yields a boxed RecordedGenerationResult
+        // (#581); this public fork API keeps returning the plain token ids the app records.
+        // wangqi modified 2026-11-13
+        tokenCollector: RecordingGeneratedTokenIDs(),
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             stopStrings: context.configuration.effectiveStopStrings,
@@ -2276,6 +2349,8 @@ public func generateRecordingTokens(
 ///         print("Tool call: \(call.function.name)")
 ///     case .rejectedToolCall(let rejection):
 ///         print("Rejected tool call: \(rejection.reason)")
+///     case .steering:
+///         break
 ///     }
 /// }
 /// ```
@@ -2430,7 +2505,14 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
 }
 
 /// Internal variant used by `ChatSession` to keep its token-prefix record in
-/// lockstep with the KV cache.
+/// lockstep with the KV cache and receive the iterator's finalized
+/// continuation state.
+struct RecordedGenerationResult {
+    let generatedTokens: [Int]
+    let state: LMOutput.State?
+    let mtpDrafterContinuation: MTPDrafterContinuation?
+}
+
 func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
@@ -2439,8 +2521,9 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil,
     toolCallPolicy: ToolCallPolicy = .init(),
-    reasoningPrimedInside: Bool = false
-) -> (AsyncStream<Generation>, Task<[Int], Never>) {
+    reasoningPrimedInside: Bool = false,
+    steering: SteeringControl? = nil
+) -> (AsyncStream<Generation>, Task<SendableBox<RecordedGenerationResult>, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
@@ -2448,6 +2531,7 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         tokenCollector: RecordingGeneratedTokens(),
+        steering: steering,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
@@ -2511,14 +2595,16 @@ func generateTaskRecordingTokens<Handler: TokenLoopHandler>(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming any TokenIteratorProtocol,
+    steering: SteeringControl? = nil,
     handler: consuming Handler
-) -> (AsyncStream<Handler.Output>, Task<[Int], Never>) {
+) -> (AsyncStream<Handler.Output>, Task<SendableBox<RecordedGenerationResult>, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
         tokenizer: tokenizer,
         iterator: iterator,
         tokenCollector: RecordingGeneratedTokens(),
+        steering: steering,
         handler: handler)
 }
 
@@ -2854,12 +2940,12 @@ private protocol GeneratedTokenCollector: Sendable {
     associatedtype Result: Sendable
 
     mutating func record(_ token: Int)
-    consuming func result() -> Result
+    consuming func result(iterator: any TokenIteratorProtocol) -> Result
 }
 
 private struct IgnoringGeneratedTokens: GeneratedTokenCollector {
     mutating func record(_ token: Int) {}
-    consuming func result() {}
+    consuming func result(iterator _: any TokenIteratorProtocol) {}
 }
 
 private struct RecordingGeneratedTokens: GeneratedTokenCollector {
@@ -2869,7 +2955,30 @@ private struct RecordingGeneratedTokens: GeneratedTokenCollector {
         tokens.append(token)
     }
 
-    consuming func result() -> [Int] {
+    consuming func result(
+        iterator: any TokenIteratorProtocol
+    ) -> SendableBox<RecordedGenerationResult> {
+        let mtpContinuation =
+            (iterator as? any MTPDrafterContinuationProviding)?
+            .mtpDrafterContinuation
+        return SendableBox(
+            RecordedGenerationResult(
+                generatedTokens: tokens,
+                state: iterator.state,
+                mtpDrafterContinuation: mtpContinuation))
+    }
+}
+
+// Plain token-id collector for the fork-added `generateRecordingTokens`, whose public
+// `Task<[Int], Never>` the app awaits. wangqi modified 2026-11-13
+private struct RecordingGeneratedTokenIDs: GeneratedTokenCollector {
+    private var tokens: [Int] = []
+
+    mutating func record(_ token: Int) {
+        tokens.append(token)
+    }
+
+    consuming func result(iterator _: any TokenIteratorProtocol) -> [Int] {
         tokens
     }
 }
@@ -2908,10 +3017,12 @@ private func generateLoopTask<
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
     tokenCollector: consuming Collector,
+    steering: SteeringControl? = nil,
     handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Collector.Result, Never>) {
     let (stream, continuation) = AsyncStream<Handler.Output>.makeStream()
 
+    let executionStream = StreamOrDevice.default.stream
     let iterator = SendableBox(iterator)
     let handler = SendableBox(handler)
     let tokenCollector = consume tokenCollector
@@ -2946,9 +3057,13 @@ private func generateLoopTask<
             // `while let token = iterator.next()` form) allowed one extra asyncEval to be
             // submitted post-cancellation, which faults if the app has backgrounded
             // (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted). The
-            // post-loop block below assigns `.cancelled`; Stream.defaultStream.synchronize() still
+            // post-loop block below assigns `.cancelled`; the captured execution stream still
             // settles any in-flight evaluation at the end of the task body.
             tokenLoop: while !Task.isCancelled {
+                if let steering, handler.canEndForSteering, steering.requestsEarlyBoundary {
+                    stopReason = .steered
+                    break
+                }
                 guard let token = autoreleasepool(invoking: { iterator.next() }) else { break }
                 tokenCollector.record(token)
 
@@ -3069,12 +3184,14 @@ private func generateLoopTask<
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream.defaultStream.synchronize()
+            executionStream.synchronize()
+
+            let result = tokenCollector.result(iterator: iterator)
 
             // Finalize the stream
             continuation.finish()
 
-            return tokenCollector.result()
+            return result
         }
 
         if let ticket = wiredMemoryTicket {
@@ -3112,6 +3229,10 @@ public enum GenerateStopReason: Sendable {
 
     /// Generation stopped because the configured max token limit was reached.
     case length
+
+    /// This model step ended at a supported boundary to apply pending steering.
+    /// The owning chat turn continues with the additional user input.
+    case steered
 
     /// Generation stopped due to explicit task cancellation or early stream termination.
     case cancelled
@@ -3168,14 +3289,20 @@ public struct GenerateCompletionInfo: Sendable {
     /// are non-nil and proposed > 0.
     public let acceptedDraftTokens: Int?
 
-    /// Non-nil when the MTP iterator transitioned into sticky-passthrough
-    /// mode for the remainder of the stream; carries the reason string
-    /// captured at the moment of engagement. Nil if the iterator stayed
-    /// speculative for the full stream or for non-MTP streams.
+    /// Non-nil when the MTP iterator transitioned into sticky passthrough or
+    /// could not export a resumable stateful boundary. Carries the first
+    /// failure reason. Nil when speculation completed with a resumable
+    /// boundary, or for non-MTP streams.
     public let passthroughReason: String?
 
     /// Speculative decoding telemetry, when generation used speculative decoding.
     public let speculativeDecodingTelemetry: SpeculativeDecodingTelemetry?
+
+    /// Why ``ChatSession`` selected ordinary generation despite configured speculation.
+    ///
+    /// Nil means no session fallback was recorded; it does not prove speculative rounds occurred.
+    /// Lower-level generation APIs leave this nil; MTP iterator diagnostics use ``passthroughReason``.
+    public internal(set) var speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason?
 
     /// Number of tool-call-shaped outputs rejected during this generation.
     public let rejectedToolCallCount: Int
@@ -3220,7 +3347,8 @@ public struct GenerateCompletionInfo: Sendable {
         passthroughReason: String? = nil,
         speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? = nil,
         rejectedToolCallCount: Int = 0,
-        recoveredToolCallCount: Int = 0
+        recoveredToolCallCount: Int = 0,
+        speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.cachedPromptTokenCount = cachedPromptTokenCount
@@ -3237,6 +3365,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.speculativeDecodingTelemetry = speculativeDecodingTelemetry
         self.rejectedToolCallCount = rejectedToolCallCount
         self.recoveredToolCallCount = recoveredToolCallCount
+        self.speculativeDecodingFallbackReason = speculativeDecodingFallbackReason
     }
 
     public func summary() -> String {
@@ -3275,7 +3404,8 @@ public struct GenerateCompletionInfo: Sendable {
             passthroughReason: passthroughReason,
             speculativeDecodingTelemetry: speculativeDecodingTelemetry,
             rejectedToolCallCount: rejected,
-            recoveredToolCallCount: recovered)
+            recoveredToolCallCount: recovered,
+            speculativeDecodingFallbackReason: speculativeDecodingFallbackReason)
     }
 }
 
@@ -3287,6 +3417,7 @@ public struct GenerateCompletionInfo: Sendable {
 /// - `.toolCall`: A tool call parsed from the generated output.
 /// - `.rejectedToolCall`: Tool-call-shaped output that was not executable.
 /// - `.info`: Metadata and performance statistics about the generation process.
+/// - `.steering`: The outcome of accepted steering instructions.
 public enum Generation: Sendable {
     /// A generated text chunk as a String.
     case chunk(String)
@@ -3314,6 +3445,9 @@ public enum Generation: Sendable {
     /// A tool-call-shaped model output rejected by parsing or authorization.
     case rejectedToolCall(RejectedToolCall)
 
+    /// The outcome of steering instructions submitted to a chat session.
+    case steering(SteeringEvent)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
@@ -3322,6 +3456,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .toolCall: nil
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -3333,6 +3468,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .toolCall: nil
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -3344,6 +3480,7 @@ public enum Generation: Sendable {
         case .info(let info): info
         case .toolCall: nil
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -3355,6 +3492,7 @@ public enum Generation: Sendable {
         case .info: nil
         case .toolCall(let toolCall): toolCall
         case .rejectedToolCall: nil
+        case .steering: nil
         }
     }
 
@@ -3366,6 +3504,19 @@ public enum Generation: Sendable {
         case .info: nil
         case .toolCall: nil
         case .rejectedToolCall(let rejection): rejection
+        case .steering: nil
+        }
+    }
+
+    /// Steering event or nil.
+    public var steering: SteeringEvent? {
+        switch self {
+        case .chunk: nil
+        case .reasoning: nil
+        case .info: nil
+        case .toolCall: nil
+        case .rejectedToolCall: nil
+        case .steering(let event): event
         }
     }
 
@@ -3375,14 +3526,14 @@ public enum Generation: Sendable {
         (batch ?? []) + [element]
     }
 
-    /// Attributes `count` prompt tokens to a reused KV-cache prefix on a `.info`
-    /// payload; every other case passes through unchanged.
-    ///
-    /// The generation loop is handed an already narrowed prompt, so only the
-    /// cache owner can supply this. See ``GenerateCompletionInfo/cachedPromptTokenCount``.
-    func attributingCachedPromptTokens(_ count: Int) -> Generation {
-        guard count > 0, case .info(var info) = self else { return self }
-        info.cachedPromptTokenCount = count
+    /// Adds session-owned cache and fallback metadata to `.info`; other events pass through.
+    func attributingSessionMetadata(
+        cachedPromptTokenCount: Int,
+        speculativeDecodingFallbackReason: SpeculativeDecodingFallbackReason?
+    ) -> Generation {
+        guard case .info(var info) = self else { return self }
+        info.cachedPromptTokenCount = cachedPromptTokenCount
+        info.speculativeDecodingFallbackReason = speculativeDecodingFallbackReason
         return .info(info)
     }
 }
