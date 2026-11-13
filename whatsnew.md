@@ -1,127 +1,133 @@
-# mlx-swift-lm Upgrade — `tag-20261024` → `tag-20261030`
+# mlx-swift-lm Upgrade — `tag-20261030` → `tag-20261113`
 
-**Merged:** 2026-10-30
-**Upstream base:** `ml-explore/mlx-swift-lm` main (15 upstream PRs: #563, #703, #712, #720, #723, #728, #730, #731, #732, #735, #736, #737, #740, #745, #746)
-**Old fork tip:** `742620475` · **New:** `0c150ad` (merge of upstream/main)
-**Dependencies moved (forced by #720):** mlx-swift 0.32.3 → **0.33.0** (`prism-1bit-0.33.0` @ `02a4a944`), mlx core v0.32.2 → **v0.32.4** (`prism-1bit-0.32.4` @ `743ae9056`)
+**Merged:** 2026-11-13
+**Upstream base:** `ml-explore/mlx-swift-lm` main, 25 upstream commits (PRs #528, #551, #581, #608, #637, #692, #711, #715, #724, #729, #743, #747, #750, #754, #761, #763, #765, #766, #769, #774, #778, #784, #786, #787, #790)
+**Old fork tip:** `0a5ff28` (version 20261030) · **New:** `c041e0e` (merge of upstream/main)
+**Dependencies:** no move. `Package.swift` and `Package.resolved` are unchanged, so the PrismML 1-bit/2-bit patch on mlx / mlx-swift is untouched.
 **Local integration doc:** `helper/docs/mlx-swift.md`
 **Primary consumer:** `ai/AIChatModelMLX.swift`
 
-15 upstream commits, plus a dependency move. #720 raises the floor to mlx-swift 0.33.0, which carries mlx core
-v0.32.4 (181 core commits since v0.32.2). The most important item for our iOS integration is that move.
-Upstream mlx now ships its own 1-bit affine kernels (#3161, written by PrismML's author). These replace the
-kernels from our PrismML patch that the Bonsai rows run on. Only the bias-free `affine_sym` path is still
-fork-only. The move also brings two Metal fence deadlock fixes (#4552, #4689), an eval-cleanup deadlock fix
-(#4556), and an iOS 26.2 launch crash fix in mlx-swift (#494). Within mlx-swift-lm itself, Qwen 3.5 now
-runs its gated-delta layers on mlx core's new fused kernel (#740). Upstream `generate()` now splits thinking
-into `.reasoning` events (#563). The app's `generateRecordingTokens` path deliberately stays unwired. Nothing
-here blocks shipping once the regression gate and the FLUX parity suites pass.
+This merge brings in 25 upstream commits. For our iOS integration, the main gain is lower load memory. #711 stops
+the loader from reading checkpoint components that a model does not have. For us that is the Gemma 4 audio
+encoder and the Qwen 3.5 MTP head. #711 also releases the source tensors before the model is materialized. On
+Qwen 3.5, the fused GatedDeltaNet input projections used to keep their 1.3 GB of sources in the buffer cache.
+Two dtype fixes keep activations out of float32 on paths we ship. #766 covers float16 VLMs on image prompts.
+#754 covers Nemotron-H, and with it our Nemotron-3-Nano-4B row. LFM2 has been rewritten for LFM2.5 (#528) and
+absorbs both of our LFM2 fork patches. LFM2's convolution layers now use a trimmable cache. That changes
+what our prompt-cache reuse can do on the five LFM2.5 rows (R2). LFM3 (#750) is new. The MiniCPM5 tool parser
+moved upstream (#637), and the fork's copy is gone. Nothing here is a silent ship-blocker. No app source change
+was forced: there is no name clash, no deprecated loader is used, and no exhaustive switch breaks. The
+regression gate below decides whether this ships.
 
 ---
 
 ## Highlights
 
 ### On-device / iOS memory & stability
-- **Gated-delta layers on mlx core's fused kernel (#740).** `gatedDeltaUpdate` uses `MLXFast.gatedDeltaUpdate`
-  when the inputs have no mask, head dim 128 and a supported (Hk, Hv) pair: (16,16), (16,32), (16,48), (16,64),
-  (24,24) or (32,32). Queries and keys are passed in float32 to avoid mlx#4725, where bf16 decay rounds to 1.
-  Upstream measures prefill up to 1.9x faster per layer, with decode unchanged. This applies to every Qwen3.5
-  row (0.8B/2B/4B), the LLM and the VLM path alike.
-- **Concurrency fixes from mlx-swift 0.33.0:** synchronous `eval` no longer holds `evalLock` (#474), a lock
-  inversion between `evalLock` and `globalStreams` is fixed (#499), a sibling-array leak on every
-  `Module.update(parameters:)` model load is fixed (#501), and `asArray` on zero-size arrays no longer crashes (#486).
-- **Fixes from mlx core v0.32.4:** Metal fence deadlocks (#4552, #4689), an eval-cleanup deadlock (#4556),
-  foreign buffer ownership (#4634), ResidencySets reading an autoreleased error (#4623), and 32-bit grid
-  overflow in reductions (#4437). SDPA memory is lower for head dims 256 and 512 (#4505, #4487, #4518). This
-  matters for Gemma 4's global layers. The SDPA threadgroup size is fixed for M1/M2-class GPUs (#4643).
-- **`GPU.deviceInfo()` is computed once and picks the device the way MLX does (#498).**
-- **Safetensors loading (mlx-swift #462, #427):** `loadArrays(urls:)` loads several files concurrently in
-  file-offset order, and `withLoadProgressHandler` reports load progress in bytes. The app does not call either yet.
+- **Skip checkpoint components a model does not have (#711, #790).** Each model family declares a `CheckpointLayout`.
+  The loader reads a part on demand, with the model, or never. Upstream measured these drops on an M4 Pro:
+  gemma-4-e4b LLM 5.43 → 4.49 GB after load, and Qwen3.5-9B-8bit prefill peak 14.04 → 11.99 GB.
+  `loadWeights` releases the checkpoint before it materializes the model, and
+  `materializeModelForInference` clears the buffer cache. Rows that benefit: `gemma-4-e2b-it-4bit`, which no
+  longer reads its audio encoder, and all `Qwen3.5-*-MLX-4bit` rows, which drop the fused GatedDeltaNet sources
+  and the MTP head. #790 fixes #711's logger so the build compiles (`MLXLogger`).
+- **VLM image prompts stay in the model dtype (#766).** On Qwen2-VL and Qwen2.5-VL, float32 M-RoPE cos/sin made
+  image prompts run every layer and the KV cache in float32. FastVLM did the same through float32 pixels, and
+  Mistral3 through a bfloat16 cast of float16 features. Those prompts had twice the KV bytes and a slower
+  decode. Our `Ministral-3-3B` row is a bfloat16 checkpoint, so its output does not change. The fix matters
+  for any float16 VLM a user imports.
+- **Nemotron-H Mamba activations stay in the input dtype (#754).** The gated RMS norm passed a float32 weight, so
+  the residual stream became float32 after the first Mamba layer. Our `NVIDIA-Nemotron-3-Nano-4B-4bit` row
+  (bfloat16) now runs with less activation memory and a faster decode. Its numerics change slightly.
+- **RotatingKVCache keeps the pinned prefix in multi-token masks (#747).** This applies only when `keep > 0`, that
+  is, when a `maxKVSize` capacity is requested. The app never sets one (`maxKVSize` is always nil), so the app
+  is not affected.
+- **MTP speculative decoding in `ChatSession` (#581).** Qwen 3.5 and Gemma drafters are resumable across turns and
+  tool restarts. #724 batches the greedy verification into one GPU readback per round (Qwen3.5-4B-4bit:
+  27.7 → 28.5 tok/s on M2), and #774 reports log probabilities from the speculative iterators. The app drives
+  `generate` directly rather than `ChatSession`, so none of this is used (see Opportunities).
 
 ### New models
-- **Nemotron 3.5 Lightning (30B-A3B) and Bolt (74B-A9B, `nemotron_h_puzzle`) (#712).** These add latent MoE
-  experts and per-layer `block_configs`, and skip the MTP head. All are far above the 4B ceiling. The
-  catalogue has no candidate here.
-- **Side effect of #712:** the Nemotron-H reasoning config (`enable_thinking`) is now declared, which also
-  covers the dense Nemotron 3 Nano 4B. **`mlx-community/NVIDIA-Nemotron-3-Nano-4B-4bit`** (`nemotron_h`,
-  about 4B params, 2.24 GB) is the only ≤4B candidate this cycle. Its tool format is `.xmlFunction`, so the
-  row would use the Qwen3-Coder / xml_function bridge id (P8).
-- `NVIDIA-Nemotron-3.5-Bolt-E4B` is a `gemma4`-architecture checkpoint (about 7.5B total, OptiQ mixed
-  precision only on mlx-community). It is not a candidate.
+- **LFM2.5 (#528):** dense and MoE LFM2.5, mixed-precision quantization, a hybrid cache with a
+  `RewindableConvolutionCache` (rewinds up to 64 positions), scoped variants, LFM2.5 DSpark speculative drafter,
+  and faster quantized MoE route grouping. LFM2VL fails with a thrown error when the vocabulary has no `<image>`
+  token. It used to fall back to id 396, which is "ab" in the LFM2.5 vocabulary. Both of our LFM2.5-VL rows
+  have `<image>` in their vocabulary.
+- **LFM3 (#750):** `model_type: "lfm3"` text model, always-on thinking (`enable_thinking` honoured), tool-call
+  format `.xmlFunction`. `lfm3_vl`, `lfm3_omni` and `lfm3_audio` are **not** registered.
+- **MiniCPM5 tool-call parser upstream (#637):** `ToolCallFormat.miniCPM5` (raw value still `"minicpm5"`),
+  `MiniCPM5ToolCallParser`, CDATA-aware.
+- **EmbeddingGemma 2:** image orientation fix and batched text (#692), soft tokens per batch row (#729),
+  `ModelMemoryReporting` (#787), x86_64 build fix (#763). There is a new `MultimodalEmbedding` contract and factory.
+- **Qwen3.5 VLM YaRN (#761):** the VLM rotary now applies `rope_type: "yarn"`. Our Qwen3.5 rows use
+  `default`, so they are unaffected.
 
 ### New capabilities / API
-- **Reasoning events (#563):** `Generation.reasoning`, `ReasoningConfig.channel` for Gemma 4's labelled
-  `<|channel>thought` blocks, and a `<think>` config for Qwen3/3.5, Nemotron-H and others. Only upstream
-  `generate()` / `ChatSession` emit them. **The fork's `generateRecordingTokens` (the app's call) does not
-  pass `reasoning:`, which is deliberate (coordinator decision), so the app still sees thinking in `.chunk`.**
-- **`ModelMemory` / `ModelContainer.memory()` (#746):** model weight bytes measured from the buffers, with
-  each buffer counted once (uses `Memory.bufferSize`, new in mlx-swift 0.33).
-- **Qwen 3.5 text geometry is readable (#737).** Gemma 4 VLM gains `hiddenStates(_:)` at
-  `@_spi(GemmaEncoder)` (#730), and `prepare` now goes through the same helper.
-- Products the app does not link: `MLXLanguageModel` prefill step size (#745), `GrammarConstraint.freshMatcher()`
-  (#732), and the guided loop now feeds the sampled token before its fast-forward tokens (#731).
+- **Mid-turn steering (#608):** `ChatSession` queues instructions and applies them at text or step boundaries.
+  This adds `Generation.steering(SteeringEvent)` and `GenerateStopReason.steered`. Both are emitted only by
+  `ChatSession` steering. The app has no exhaustive switch over either enum.
+- **Load progress (#551, 0877a36):** `LoadProgressHandlers` (`.download`, `.weights`). Weight reading now reports
+  byte progress. The `progressHandler:` overloads are deprecated.
+- **Checkpoint sampling defaults:** `GenerationConfigFile` decodes `temperature/top_p/top_k/min_p/repetition_penalty`.
+  `ModelContainer.defaultGenerateParameters` exposes them. The app always passes its own `GenerateParameters`, so
+  nothing changes for us.
+- `ModelTypeRegistry.contains(_:configuration:)` (#778). Guided generation shows the response schema
+  (#715, MLXFoundationModels only).
 
 ### Correctness fixes
-- **Attention masks are sized by the cache, not the absolute offset (#728).** `createAttentionMask(h:cache:)`
-  delegates to `cache.first.makeMask`. Qwen3-VL-MoE builds one shared mask, and Gemma2 boolean masks
-  now suppress keys instead of adding to the scores.
-- **Prefill over a quantized KV cache uses the fused SDPA kernel for L ≥ 64 (#703)**, for head dims
-  64/72/80/96/128.
-- Gemma 3 RoPE scaling is read from `rope_parameters` (#723). FastVLM's negative image sentinels are kept
-  out of the repetition-penalty history (#735). Bert `id2label` key collisions now throw instead of trapping (#736).
-- Core: split-K quantized matmul partials are kept in float32 (#4641), the fast qmv kernel handles outputs not
-  divisible by 8 (#4516), qvm_split_k batched row count is fixed (#4673), sigmoid now matches between compiled
-  and eager runs (#4461), and fp quantized matmul corruption when K % 32 != 0 is fixed (#3912).
+- GLM-OCR prompts put images before text (#765), matching the model's template. This affects our `GLM-OCR-4bit-mlx` row.
+- PythonLiteralParser decodes surrogate pairs, `\x`, octal and the other Python escapes (#769), and reads
+  triple-quoted strings (#786). Pythonic tool calls with these values used to pass raw text to the tool.
+- A flaky usage test on the tool-calling path is fixed (#784).
 
 ### Build / toolchain
-- `Package.swift` still uses `.package(path: "../mlx-swift")`. Upstream requires `.upToNextMinor(from: "0.33.0")`.
-  mlx-swift-lm's `CompileOverloads.swift` is deleted, because mlx-swift's own `compile` now returns `@Sendable`
-  closures from `@Sendable` inputs (#469). A `compile { }` that captures a `Module` without `inputs:` no longer
-  compiles.
-- mlx-swift #494 removes the `cLogSupport` target. #418 adds `MaterializedArray`, a Sendable `MLXArray` subtype, and #510
-  restores `update(parameters:)` recursion. mlx-c is v0.8.0 (`a26f2d58`). mlx core fixes cooperative-tensor
-  builds on macOS 27 (#4594).
-- `thirdparty/mlx-audio-swift` is now compiled against mlx-swift 0.33.0 through the local override, even though its own
-  manifest says `from: "0.32.3"`. Its `compile` wrappers already take `@Sendable` closures, and Parakeet passes `inputs:`.
+- Integration tests run on Xcode 27 (#743). No toolchain floor moved.
 
 ### Tests
-- New upstream: `ModelMemoryTests`, `NemotronHTests`, `Gemma2Tests`, `Gemma3RopeParametersTests`,
-  `Qwen35ContinuationTests`, `Qwen3VLMoEContinuationTests`, `Qwen3EmbedderMaskTests`,
-  `Gemma4VLMHiddenStatesTests`, `FreshMatcherTests`, `GuidedForwardStateTests`, `PrefillStepSizeTests`,
-  plus quantized-KV prefill cases in `KVCacheTests`, and `GatedDeltaTests` expanded.
-- Fork gate (P3/P4): `swift build` OK, and `ToolTests|TokenStreamDecoder|ChatTests` 119 passed. mlx-swift
-  `QuantizationTests` 11/11, including the 3 PrismML gates (`testBiasFreeLowBitMatchesDerivedBias`).
+- There are large new suites: LFM2/LFM3/LFM2DSpark/LFM2MoE, Steering, MTP, ModelLoadProgress, UnreadCheckpointTowers,
+  RotatingKVCacheKeepMask and Qwen35VLMYarn. The fork's `MiniCPM5FunctionParserTests` now target the upstream parser.
 
 ---
 
 ## Fork-local work this cycle
 
 ### Conflicts and fork patches (P3)
-- 5 conflicts: `Package.swift`, `Evaluate.swift`, `TokenLoopHandler.swift`, `TokenStreamDecoder.swift` and
-  `ToolCallFormat.swift`. `fallbackParser` sits before upstream's `toolCallPolicy, reasoning` on every
-  signature in the chain `TextToolTokenLoopHandler → makeTokenStreamDecoder → StandardTokenStreamDecoder →
-  ToolCallProcessor`. Every line the fork added is still present. There are 27 files with `wangqi modified` markers (26 before).
-- Gemma4FunctionParser, the Gemma4Processor assistant+tool merge, and the LFM2/LFM2VL/Paligemma fixes are kept, because
-  upstream #563 did not change Gemma 4 tool-call parsing.
-- `chunkedVLMPrefill` still has no production callers. Gemma4 and Qwen3-VL-MoE multimodal `prepare` are still
-  single-shot, as before. No VLM prefill patch was added or dropped.
+| File | Resolution |
+|---|---|
+| `MLXLLM/Models/LFM2.swift` | Took upstream verbatim. #528 absorbs both fork patches: the `intermediate_size` fallback and the `language_model.` prefix strip. Verified on the real `LFM2.5-2.6B-4bit` checkpoint, which has 600 `language_model.model.*` keys. |
+| `Tool/ToolCallFormat.swift` | Took upstream's `.miniCPM5` / `MiniCPM5ToolCallParser` (#637). Kept the fork's `Gemma4FunctionParser` and the `fallbackParser` param. |
+| `Tool/ToolCallFormatInference.swift` | Took upstream verbatim. The auto-merge had put in both MiniCPM5 signatures, and the fork one was dropped. |
+| `Parsers/MiniCPM5FunctionParser.swift` | Deleted, replaced by upstream's parser. Its tests were retargeted and keep the recorded MiniCPM5-1B output. |
+| `Parsers/MiniCPM5ToolCallParser.swift` | **New fork patch.** It overrides `parseEOS`, which put the start tag back on each segment so that a call still buffered at EOS is not lost. |
+| `MLXLMCommon/Evaluate.swift` | **New fork patch.** #581 changed `RecordingGeneratedTokens` to return `SendableBox<RecordedGenerationResult>`. The fork-local `RecordingGeneratedTokenIDs` keeps `generateRecordingTokens(...) -> (AsyncStream<Generation>, Task<[Int], Never>)` unchanged for `AIChatModelMLX`. |
+
+`wangqi modified` inventory: 27 files / 89 marks at `0a5ff28` → 25 files / 85 marks now. Upstream absorbed 7
+marks (LFM2 −2, MiniCPM5FunctionParser −1, ToolCallFormat −2, ToolCallFormatInference −2), and 3 were added
+(the new parser patch +1, Evaluate +2). Upstream deleted or renamed no fork-patched file. The fork's
+`chunkedVLMPrefill` has had no caller since 2026-08-10 and is unchanged.
+
+**Decision taken: MiniCPM5 truncated tool calls are discarded.** The fork parser kept a value cut off by the
+token limit (no `</param>`/`</function>`). Upstream returns nil for that call. We took upstream, so no call
+runs on truncated arguments (R3).
 
 ### Dependency reconciliation (P4)
-- mlx core `prism-1bit-0.32.4` (base v0.32.4 `36969c094`): upstream #3161 **is** PrismML commit 1 plus commit 2's
-  `K == 64 && bits >= 2` qmv_quad guard. Both cherry-picks resolved to the base and were skipped as empty.
-  Only the bias-free `affine_sym` work is still fork-only: `5c30ce419` (host), `1c0bb0310` (kernel port, now 7
-  template args after #4516's `partial_rows`), and `743ae9056` (PRISM-PATCH.md).
-- **Gap closed:** `use_qmv_wide` used to route `affine_sym` with `2 ≤ M < vector_limit` to a non-existent
-  `affine_sym_qmv_wide` kernel, which failed at JIT. It has done so since `prism-1bit-0.32.2`. `dispatch_qmv` now
-  excludes it.
-- mlx-swift `prism-1bit-0.33.0` @ `02a4a944` (base tag 0.33.0 `7ede4fd6`): `.gitmodules` → wangqi/mlx, the
-  FMT_CONSTEVAL block, the core gitlink, 2 regenerated files (`mlx-generated/metal/quantized.{h,cpp}`; the
-  `quantized_nax.*` files no longer differ), and 3 fork quantization tests.
+No move: mlx-swift stays on `prism-1bit-0.33.0` and mlx core on `prism-1bit-0.32.4`. The PrismML patch is unaffected.
+`swift build` is green, and the app package resolve shows no GitHub mlx-swift (P5).
 
-### Reasoning events: decision
-`generateRecordingTokens` does not pass `reasoning:` (commented in place at `Evaluate.swift`), so app behaviour
-is unchanged. `AIChatModelMLX` reads only `event.chunk` and parses `<think>` and Gemma channels itself.
-Wiring it end to end is listed under Follow-ups as an opportunity.
+### App consumers (P7)
+- **`MiniCPM5ToolCallParser` name clash:** checked, no fix needed. The app's `class MiniCPM5ToolCallParser`
+  (`ai/tool/parser/`) now shares its name with upstream's public struct. The app-module files that use it
+  (`ToolCallParserChain.swift`) do not import MLXLMCommon, and an app-module declaration shadows an imported
+  one anyway. The test files that use it (`ToolCallParserTests`, `CoreAIToolCallFallbackTests`) do not import
+  MLXLMCommon either. No other new public type (38 checked) collides with an app type.
+- **Deprecated `progressHandler:` loaders:** none in use. Every app and test load is `loadContainer(from: URL, using:)`.
+  `loadMLXContainer(modelDirectory:progressHandler:)` takes a closure but never passes it to the library
+  (see Opportunities).
+- **Defaults that changed under us:** VLM dtype (#766), no effect on our bf16 rows. RotatingKVCache (#747) has no
+  effect, since there is no capacity. Sampling defaults have no effect, since the app's parameters are explicit.
+  The LFM2 cache topology did change (R2).
+- **`PromptCacheReusePolicy`** gained speculative states (`trimToCommonPrefixMainOnly`,
+  `SpeculativeCacheReuseCapability`). The app's main-only mirror (`MLXPromptCacheReuse`) needs no change.
 
 ---
 
@@ -129,70 +135,101 @@ Wiring it end to end is listed under Follow-ups as an opportunity.
 
 | Area | Effect on iOS |
 |------|---------------|
-| Bonsai 1-bit rows | Now run upstream's 1-bit affine kernels (#3161). Same math, unrolled, plus a tail block |
-| Ternary-Bonsai 2-bit / `affine_sym` | Fork kernels kept; 2 ≤ M < vector_limit no longer fails at JIT |
-| Qwen3.5 0.8B/2B/4B | Gated delta on mlx core's fused kernel, faster prefill (#740) |
-| Gemma 4 E2B | Lower SDPA memory for D256/D512 (core); `prepare` refactored behind `hiddenStates` (#730) |
-| Stability | Metal fence and eval deadlocks fixed (core); iOS 26.2 Logger launch crash fixed (#494); eval lock and stream lock fixes |
-| Thinking / tool calls | Unchanged on the app path (`generateRecordingTokens` unwired) |
-| TurboQuant KV (`turbo0v4`) | Unchanged: #703 only routes `QuantizedKVCache` (`kvBits`), which the app never sets |
-| Masks with no rotating cache | Equivalent: `maxKVSize` is always nil in the app (#728) |
-| FLUX.2 imagegen / mlx-audio | Same API. Numerics may move slightly (split-K float32 partials #4641, qmv tail #4516) |
+| Load memory | Lower footprint and peak on Gemma 4 and Qwen 3.5 rows (#711). The app's file-size load estimate now over-counts these rows, which is the safe side. |
+| VLM KV memory | float16 VLM image prompts no longer double the KV cache (#766). |
+| Nemotron-3-Nano-4B | Activations no longer in float32 (#754). Lower memory, faster decode, slightly different numerics. |
+| LFM2.5 rows (5) | New model code (#528). Conv layers use `RewindableConvolutionCache`, so a prompt-cache rewind of up to 64 tokens can now be reused instead of rebuilt (R2). |
+| GLM-OCR | Images before text (#765). OCR output may change. |
+| MiniCPM5 tool calls | Upstream parser. Truncated calls dropped (R3). |
+| Background / ANE | Nothing. MLX still needs the GPU. |
 
 ---
 
-## Risk Assessment — **6 identified risks** (3 medium, 3 low)
+## Risk Assessment — **6 identified risks** (2 medium, 4 low)
 
-### R1 — Dependency move: Bonsai 1-bit now on upstream kernels, `affine_sym` re-based (MEDIUM)
-Every 1-bit affine qmv/qmm call now runs upstream's #3161 kernels instead of PrismML's. The bias-free path was
-re-based onto `qmv_fast_impl`'s new `partial_rows` parameter, and the qmv_wide gap was closed. 181 core commits
-also changed quantized dispatch (#4516, #4641, #4673, #4629). The kernel gate passed (QuantizationTests 11/11).
-*Verify:* `run_model_tests.py --mlx-only --compare <P1>` for all four Bonsai rows (`Bonsai-4B-mlx-1bit`,
-`Ternary-Bonsai-{1.7B,4B,8B}-mlx-2bit`), plus `testcases/engines/local/BonsaiLowBitInferenceTests`. Any new
-text drift on a Bonsai row is a real finding, not noise.
+### R1 — LFM2 rewrite on our five LFM2.5 rows (MEDIUM)
+#528 replaces `LFM2.swift`/`LFM2MoE.swift` and adds `LFM2Support`, with new sanitize, mixed-precision quant and a new cache.
+The rows affected are `LFM2.5-1.2B-Instruct-MLX-4bit`, `LFM2.5-2.6B-4bit`, `LFM2.5-8B-A1B-MLX-4bit` (MoE) and
+`LFM2.5-VL-1.6B`/`-3B`. P3 verified the 2.6B key layout only.
+*Verify:* run `MLXCatalogueRegressionTests` (Mac) on all five LFM2.5 rows and compare with the 20261030 baseline,
+checking load, a coherent reply, a tool call and an image description for the VL rows.
 
-### R2 — #740 fused gated delta on Qwen 3.5 (MEDIUM)
-This is a new mlx core Metal kernel (#4020/#4565). Every Qwen3.5 decode and prefill step that meets the
-shape gate now runs it, with float32 q/k casts added per step. Upstream measured on M4 Pro and Qwen3.5-9B
-only. Mobile GPUs (A17/A18) and the 0.8B/2B/4B geometries are not covered.
-*Verify:* the regression gate for the three Qwen3.5 rows (text and `--tool-call`), and an on-device turn
-comparing `[MLX-PERF] prefillTps / decodeTps / peak` against OLD.
+### R2 — LFM2 convolution cache is now trimmable (MEDIUM)
+`RewindableConvolutionCache.isTrimmable` is `true`. It used to be `MambaCache`, which is not trimmable. `applyPromptCacheReuse` in
+`AIChatModelMLX` (`layers.allSatisfy { $0.isTrimmable }`) therefore now picks `trimToCommonPrefix` on LFM2.5 rows
+where it used to rebuild. A conv layer can rewind at most 64 positions (`maxTrimCount`). A larger trim returns
+0 for that layer, the existing `trimShortfall` check downgrades to a rebuild, and the attention layers are
+discarded with the old cache. That is correct, but it costs one useless trim. A short rewind is now reused:
+this is a speed win, and also a new correctness surface for hybrid rewind.
+*Verify:* run `MLXPromptCacheReuseTests` and `MLXAssistantReplayTests`. Then run a live multi-turn chat on
+`LFM2.5-1.2B-Instruct-MLX-4bit` (Mac, Protocol Inspector on). Check the `[MLX-KVREUSE]` lines for
+`trimToCommonPrefix` versus `trimShortfall`. A reply after a rewind must match a cold-cache reply to the same
+prompt at temperature 0.
 
-### R3 — mlx-swift 0.33 eval/lock rework under concurrent MLX users (MEDIUM)
-#474 moves synchronous `eval` out from under `evalLock`. #499 and #4689/#4552 change fence and stream locking.
-The app can run MLX LLM, mlx-audio (TTS/ASR/VAD) and FLUX in one process. These are fixes, but they change
-timing on exactly the paths that used to deadlock.
-*Verify:* `run_audio_tests.py --compare`, the FLUX parity suites (P10), and one manual chat-with-TTS turn on device.
+### R3 — MiniCPM5 truncated tool calls are discarded (LOW, decision taken)
+When a tool call is cut off by `maxTokens`, it is no longer executed with partial arguments. The user sees no
+call. Rows: `MiniCPM5-1B-4bit` (MLX); the Core AI and GGUF rows use the app's own parser.
+*Verify:* run `swift test --filter MiniCPM5` (fork; the "Content split on the start tag" case covers EOS
+buffering) and `MLXCatalogueRegressionTests` on `MiniCPM5-1B-4bit` with its tool prompt. Restore the leniency
+only if the regression shows truncated calls that matter.
 
-### R4 — FLUX.2 parity tolerances under core numeric changes (LOW)
-Split-K partials in float32 (#4641) and the qmv tail fix (#4516) can shift results in the last few bits. The
-tolerances are measured against Python. Never loosen one. *Verify:* `Flux2{Block,Transformer,VAE}ParityTests`
-and `Flux2PipelineEndToEndImageTests`.
+### R4 — #711 component skipping on Gemma 4 / Qwen 3.5 (LOW)
+The loader now decides per component whether to read the tensors. A wrong layout would fail the load or leave
+weights unread. #711 says preparation still drops the same names, so the model is the same.
+*Verify:* run `MLXCatalogueRegressionTests` on `gemma-4-e2b-it-4bit` (text and image) and `Qwen3.5-0.8B/2B/4B`. Run
+`MLXMemoryBudgetTests` and `MLXKVCacheEstimateTests`; they should still pass, because the estimate only gets more
+conservative.
 
-### R5 — #563 changed upstream `generate()`'s stream (LOW, test harness fixed)
-Upstream `generate()` now diverts thinking into `.reasoning`. `MLXCatalogueRegressionTests` judged its
-plain, chat and vision probes on `event.chunk` from `generate()`, so it no longer saw what the app sees. P7
-switched those probes to `generateRecordingTokens`, which is the app's call. The app's benchmark sample
-(`runMLXBenchmarkSample`), `LocalModelBenchmarkPOCTests` and `BonsaiLowBitInferenceTests` still call
-`generate()`. The first two read only `.info`. Bonsai uses a raw prompt with no thinking opener.
+### R5 — Numeric drift: Nemotron-H (#754), GLM-OCR prompt order (#765) (LOW)
+Both changes are intended, but the outputs differ from the 20261030 baseline.
+*Verify:* in `MLXCatalogueRegressionTests`, judge `NVIDIA-Nemotron-3-Nano-4B-4bit` and `GLM-OCR-4bit-mlx` by reply
+quality, not by an exact match with the old output.
 
-### R6 — #728 mask delegation and #703 quantized-KV prefill (LOW)
-With `maxKVSize` nil and no `kvBits`, the app's masks are equivalent and #703 is never taken. Exception: a
-hybrid model whose `cache.first` is a non-attention cache now gets that cache's `makeMask`. *Verify:*
-`MLXPromptCacheReuseTests`, `MLXKVCacheEstimateTests`, and the LFM2 / granite-4.2 rows in the regression gate.
+### R6 — `generateRecordingTokens` fork re-plumb (LOW)
+The fork keeps the `[Int]` token-id API on a fork-local collector, because #581 changed the upstream type.
+The prompt-cache ledger depends on these ids.
+*Verify:* run `MLXPromptCacheReuseTests`, `MLXAssistantReplayTests` and `MLXFinalStatsTests`. Then run a live two-turn chat
+on any text row and check the `[MLX-KVREUSE] decision=appendSuffix` line on turn 2.
+
+---
+
+## New models (MLX 4-bit, ≤ 4B)
+
+Already in the catalogue: `MiniCPM5-1B-4bit`, all five LFM2.5 rows, and `LFM3-1.7B-Q4_K_M` / `LFM3-VL-2B-Q4_K_M` (GGUF only).
+LFM Open License v1.0 allows redistribution with attribution, and the existing LFM MLX rows already rely on it.
+
+| Model (HF repo) | Size | License | Decision | Reason |
+|---|---|---|---|---|
+| `LiquidAI/LFM3-1.7B-MLX-4bit` (`lfm3`) | 0.99 GB | LFM 1.0 | **Add** | A new family supported this merge, and the GGUF twin is already a row. Tools via `.xmlFunction` (`<tool_call><function=…>`), always-on `<think>`. Copy the GGUF row's sampling (temp 0.1, top_k 50, rep 1.1); `toolcall_parser_id` stays empty, as on the LFM2.5 MLX rows. Run `MLXCatalogueRegressionTests` before shipping. |
+| `mlx-community/MiniCPM5-2B-mlx-4Bit` (`llama`) | 1.43 GB | Apache-2.0 | **Add** | The GGUF and Core AI 2B rows exist, and the template uses the same `<function name=` tool format, so `toolcall_parser_id: "minicpm5"`. The `-chat-mlx-4bit` repo is the same base and size, with fewer downloads. |
+| `LiquidAI/LFM2.5-1.2B-Thinking-MLX-4bit` (`lfm2`) | 0.66 GB | LFM 1.0 | Decision | A small reasoning model, but LFM3-1.7B (always thinking, newer) covers the same slot. Add only if a sub-1 GB thinking row is wanted. |
+| `LiquidAI/LFM2.5-VL-450M-MLX-4bit` (`lfm2-vl`) | 0.38 GB | LFM 1.0 | Reject | The GGUF row `LFM2.5-VL-450M-Q8_0` already covers it, and VL-1.6B is the MLX vision entry. |
+| `LiquidAI/LFM2.5-350M-MLX-4bit`, `-230M-MLX-4bit` | 0.23 / 0.15 GB | LFM 1.0 | Reject | Too weak for general chat. |
+| `LiquidAI/LFM3-VL-2B-MLX-4bit` (`lfm3_vl`) | 1.61 GB | LFM 1.0 | Reject | `lfm3_vl` is not registered in MLXVLM (#750 is text only). Revisit when upstream adds the wrapper. |
+| `LiquidAI/LFM3-Omni-2B` / `LFM3-Audio-2B` MLX 4-bit | 2.13 / 1.75 GB | LFM 1.0 | Reject | `lfm3_omni` / `lfm3_audio` are unsupported. |
+| `mlx-community/embeddinggemma-2-4bit` | 1.13 GB | Apache-2.0 | Decision | This is not a chat row. It would serve semantic search (Opportunities), but it bundles the vision and audio encoders, so a text-only conversion would be far smaller. |
+
+---
+
+## Opportunities (not built)
+
+| Upstream feature | Consumer that would use it | Value |
+|---|---|---|
+| `LoadProgressHandlers.weights` (#551) | `AIChatModelMLX.loadMLXContainer` (its `progressHandler` is dropped today, so `load_progress` never moves) | A real load progress bar for large MLX models on iOS: one argument, `progress: .weights(progressHandler)`. |
+| MTP speculative decoding (#581, #724, #774) | `AIChatModelMLX` text path on Qwen 3.5 rows (the checkpoints carry the MTP head) | Faster decode without a second model. It needs `ChatSession` or `MTPSpeculativeTokenIterator` in place of `generateRecordingTokens`. |
+| Mid-turn steering (#608) | Chat input while a local reply streams | The user can redirect an answer without stopping it. Requires a `ChatSession` adoption. |
+| Token log probabilities (#774, speculative too) | Laya / confidence displays, `AIChatModelMLX` | Per-token confidence from local models. |
+| `ModelContainer.defaultGenerateParameters` | Model detail defaults for imported MLX models | Seed sampling from the checkpoint's `generation_config.json` when the user has not set values. |
+| EmbeddingGemma 2 + `MultimodalEmbedding` (#692, #729, #787) | `RelevanceScorerFactory` (memory / knowledge base) | An on-device multilingual and image embedding with memory reporting. |
+| LFM2.5 DSpark drafter (#528) | LFM2.5 rows | Speculative decoding for the LFM rows. |
 
 ---
 
 ## Follow-ups
-1. Build both schemes (`AIAssistant` iOS, `AIAssistantMac`). The iOS build is the only one that compiles the
-   `#if os(iOS)` fork paths and mlx-audio-swift against 0.33.0 for iOS.
-2. P10 regression with `--compare` (generate and `--tool-call`), the FLUX parity suites, and `run_audio_tests.py`.
-   This is required because P4 moved mlx-swift and mlx.
-3. P8 candidate: `mlx-community/NVIDIA-Nemotron-3-Nano-4B-4bit` (`nemotron_h`, `.xmlFunction`, thinking on by default).
-4. Opportunity: wire `.reasoning` end to end. Pass `reasoning:` in `generateRecordingTokens` and handle
-   `event.reasoning` in `AIChatModelMLX.consumeMLXStream` by feeding it to the think UI. This also stops tool
-   calls fired from inside the thinking block. It needs the `--tool-call` regression in the same change.
-5. Opportunity: replace the app's weight-size estimate with `ModelContainer.memory()` (#746) for the memory
-   budget log. Use `withLoadProgressHandler` for a byte-accurate MLX load progress bar.
-6. P12 docs: UPGRADING.md's "3 PrismML commits" wording now reads "bias-free affine_sym only (upstream #3161
-   absorbed commits 1-2)". Record the mlx-swift / mlx axis move.
+1. Build both schemes (`AIAssistant` iOS, `AIAssistantMac`). No app source changed in this upgrade.
+2. Unit suites: `MLXFinalStatsTests`, `MLXKVCacheEstimateTests`, `MLXMemoryBudgetTests`, `MLXPromptCacheReuseTests`,
+   `MLXAssistantReplayTests`, `MLXReasoningStreamTests`, `ToolCallParserTests`, `AppToolCallParserBridgeTests`,
+   `CoreAIToolCallFallbackTests`, `MLXBrokenQuantConfigTests`.
+3. Mac regression: `MLXCatalogueRegressionTests` on all MLX rows. R1, R4 and R5 must be judged by quality.
+4. Add the rows for `LFM3-1.7B-MLX-4bit` and `MiniCPM5-2B-mlx-4Bit` (mirror, `models_test.json`), add LFM3 to
+   `mlxSwiftSupportedModels`, and record #711 and the LFM2.5 cache in `helper/docs/mlx-swift.md`.
